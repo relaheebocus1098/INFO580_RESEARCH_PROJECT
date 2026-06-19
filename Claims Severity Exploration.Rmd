@@ -1,0 +1,2811 @@
+---
+title: "Claims Severity GLM Models Exploration"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries Load
+
+```{r, include=FALSE}
+library(here)
+library(dplyr)
+library(rsample)
+library(recipes)
+library(MASS)
+library(survival)
+library(pROC)
+library(knitr)
+library(corrplot)
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+```
+
+
+# Data Exploration
+
+The target variable avg_claim_cost is the average cost per claim for policies that recorded at least one claim in the observation year. The full distribution is highly right-skewed, with the vast majority of claims concentrated at low values and a long tail extending beyond €100,000. A zoomed-in view confirms the heavy mass below €1,000, with frequency dropping sharply thereafter. To operationalise this skew, a severity threshold of €900 is applied: claims at or below this value are classified as attritional and those above as extreme. At this cut-off, approximately 91% of claimants fall in the attritional segment, yielding roughly one extreme claim for every ten attritional claims.
+
+```{r, echo=FALSE}
+
+# =============================================================================
+# A: DATA LOADING
+# =============================================================================
+
+basic_glm_data <- read.csv(
+  here("Feature_Selection_Four_Wheels_GLM_R.csv")
+)
+
+basic_glm_data_no_na <- basic_glm_data[!is.na(basic_glm_data$avg_claim_cost), ]
+
+h = ggplot(basic_glm_data_no_na, aes(avg_claim_cost)) +
+  geom_histogram(binwidth = 500, fill = "blue", color = "white") +
+  labs(
+    title = "Claims Severity Distribution",
+    x = "Average Claim Cost",
+    y = "Count"
+  )
+
+h
+
+# 1. Save your plot to a variable
+p = ggplot(basic_glm_data_no_na, aes(avg_claim_cost)) +
+  geom_histogram(binwidth = 200, fill = "blue", color = "white") +
+  coord_cartesian(xlim = c(0, 5000)) +
+  labs(
+    title = "Claims Severity Distribution (Zoomed In)",
+    x = "Average Claim Cost",
+    y = "Count"
+  )
+
+p
+
+# 2. Build the plot data
+plot_data <- ggplot_build(p)$data[[1]]
+
+benchmark <- plot_data$xmax[5]
+pct_within <- mean(basic_glm_data_no_na$avg_claim_cost <= benchmark) * 100
+total_claims <- nrow(basic_glm_data_no_na)
+attritional_count <- sum(basic_glm_data_no_na$avg_claim_cost <= benchmark)
+extreme_count <- total_claims - attritional_count
+ratio_val <- round(extreme_count / attritional_count, 3)
+
+# 2. Print the narrative to the output
+cat(
+  "At ", benchmark, ", ", round(pct_within, 2), "% of the data falls within. ",
+  "This corresponds to ", attritional_count, " attritional claims and ",
+  extreme_count, " extreme claims — meaning that for every 1 attritional claim, there are ",
+  ratio_val, " extreme claims.",
+  sep = ""
+)
+```
+
+```{r, echo=FALSE}
+# =============================================================================
+# REVISED PLOT & ANALYSIS (Cutoff at 900)
+# =============================================================================
+
+# 1. Build the plot with the vertical line and text label
+p = ggplot(basic_glm_data_no_na, aes(avg_claim_cost)) +
+  geom_histogram(binwidth = 200, fill = "blue", color = "white") +
+  coord_cartesian(xlim = c(0, 5000)) +
+  
+  # Add the red dashed vertical line at 900
+  geom_vline(xintercept = 900, linetype = "dashed", color = "red", linewidth = 1) +
+  
+  # Add the floating text label near the top of the plot
+  annotate(
+    "text", 
+    x = 1050,                  # Placed slightly to the right of the line so it doesn't overlap
+    y = Inf,                   # Automatically pins it to the top of the y-axis
+    label = "Cutoff: $900\n≤ Attritional (91.27%) | > Extreme (8.73%) ", 
+    color = "red", 
+    fontface = "bold",
+    hjust = 0,                 # Left-aligns the text relative to the x coordinate
+    vjust = 2                  # Nudges the text down slightly so it doesn't clip the top border
+  ) +
+  
+  labs(
+    title = "Claims Severity Distribution (Zoomed In)",
+    x = "Average Claim Cost",
+    y = "Count"
+  )
+
+# Display the plot
+p
+
+# 2. Hardcode your new benchmark so your calculations match your visual
+benchmark <- 900
+
+pct_within <- mean(basic_glm_data_no_na$avg_claim_cost <= benchmark) * 100
+total_claims <- nrow(basic_glm_data_no_na)
+attritional_count <- sum(basic_glm_data_no_na$avg_claim_cost <= benchmark)
+extreme_count <- total_claims - attritional_count
+ratio_val <- round(extreme_count / attritional_count, 3)
+
+# 3. Print the updated narrative
+cat(
+  "At $", benchmark, ", ", round(pct_within, 2), "% of the data falls within. ",
+  "This corresponds to ", attritional_count, " attritional claims and ",
+  extreme_count, " extreme claims — meaning that for every 1 attritional claim, there are ",
+  ratio_val, " extreme claims.",
+  sep = ""
+)
+```
+
+
+# Data Pre-processing
+
+The dataset is split at the client level (not the policy level) to prevent data leakage: all policies belonging to a given client are assigned exclusively to either the training or test set. Stratification is performed on a composite stratum combining whether the client ever lapsed, ever claimed, and the number of policies they hold, ensuring both splits are representative of the portfolio's behavioural structure. The final split produces 15,156 training policies and 3,788 test policies across 12,080 and 3,021 unique clients respectively. Within the training set, a 5-fold grouped cross-validation structure is constructed on the same client-level grouping, so that no client's data appears in both the analysis and assessment folds of any split. This CV structure is used throughout to produce stable, leak-free estimates of out-of-sample performance before evaluating on the hold-out test set.
+
+Predictors are encoded inside each CV fold and on the full train/test split independently, so that dummy levels and zero-variance columns are learned only from training data and applied to validation/test data — preventing any look-ahead bias in the feature pipeline. Premium-related variables (premium_band, premium_vs_median_band) are excluded from all model matrices given their endogenous relationship with the target.
+
+
+```{r, include=FALSE}
+
+# =============================================================================
+# C: VARIABLE DEFINITIONS
+# =============================================================================
+
+ordinal_levels <- list(
+  age_category                     = c("18-25","26-35","36-45","46-55","56-65","65+"),
+  age_when_licensed_band           = c("<=25",">25"),
+  driving_exp_category             = c("<=5yrs","6-10yrs","11-20yrs","20+yrs"),
+  vehicle_age_category             = c("0-3yrs","4-7yrs","8-12yrs","12+yrs"),
+  power_band                       = c("<100",">100"),
+  cylinder_band                    = c("0-1400","1400-1600","1600-2000","2000+"),
+  value_band                       = c("0-17500","17500-25000","25000-32500","32500+"),
+  weight_band                      = c("0-1100","1100-1500","1500+"),
+  length_imputed_band              = c("<4","4-4.5",">4.5"),
+  n_doors_band                     = c("<=4",">4"),
+  claims_history_band              = c("zero","one","two_to_three","four_to_five","six_plus"),
+  r_claims_history_band            = c("0","0-0.35","0.35-0.7","0.7-1.5","1.5+"),
+  avg_claims_per_year_history_band = c("0","0-1",">1"),
+  cross_sell_ratio_band            = c("<0.75",">=0.75"),
+  policy_retention_rate_band       = c("<1","1"),
+  risk_score_band                  = c("0","0-0.01","0.01-0.15","0.15-0.2","0.2+"),
+  premium_band                     = c("0-250","250-300","300-350","350-400","400+"),
+  premium_vs_median_band           = c("-15%","-15% to 0%","0% to 15%","15% to 30%","30%+")
+)
+
+always_exclude  <- c("id","id2","n_claims_year","avg_claim_cost",
+                     "lapse_flag","days_to_event","exposure_years",
+                     "r_claims_history_band","claims_history_band")
+premium_exclude <- c("premium_band","premium_vs_median_band")
+target          <- "avg_claim_cost"
+THRESHOLD       <- 900          # extreme = cost > THRESHOLD
+
+
+# =============================================================================
+# D: CLIENT-STRATIFIED TRAIN–TEST SPLIT (80:20)
+# =============================================================================
+
+set.seed(42)
+client_strat <- basic_glm_data_no_na %>%
+  group_by(id) %>%
+  summarise(ever_lapsed  = as.integer(any(lapse_flag == 1,   na.rm=TRUE)),
+            ever_claimed = as.integer(any(n_claims_year > 0, na.rm=TRUE)),
+            n_policies   = n(), .groups = "drop") %>%
+  mutate(policy_tier = case_when(n_policies==1~"1",n_policies==2~"2",TRUE~"3+"),
+         strata       = paste(ever_lapsed, ever_claimed, policy_tier, sep="_"))
+
+rare <- names(table(client_strat$strata)[table(client_strat$strata)==1])
+client_strat <- client_strat %>%
+  mutate(strata = if_else(strata %in% rare, "other", strata))
+
+split_obj  <- initial_split(client_strat, prop=0.8, strata=strata)
+train_data <- basic_glm_data_no_na %>% filter(id %in% training(split_obj)$id)
+test_data  <- basic_glm_data_no_na %>% filter(id %in% testing(split_obj)$id)
+
+stopifnot(length(intersect(unique(train_data$id), unique(test_data$id))) == 0)
+cat(sprintf("Train: %d policies | %d clients\nTest : %d policies | %d clients\n",
+            nrow(train_data), n_distinct(train_data$id),
+            nrow(test_data),  n_distinct(test_data$id)))
+
+# Claimant subsamples
+train_sev <- train_data %>% filter(n_claims_year > 0)
+test_sev  <- test_data  %>% filter(n_claims_year > 0)
+cat(sprintf("Claimant rows — Train: %d  |  Test: %d\n", nrow(train_sev), nrow(test_sev)))
+
+
+# =============================================================================
+# E: GROUPED 5-FOLD CV STRUCTURE
+# =============================================================================
+
+set.seed(42)
+cv_folds <- group_vfold_cv(train_data, group=id, v=5)
+stopifnot(all(vapply(cv_folds$splits, function(sp)
+  length(intersect(unique(analysis(sp)$id), unique(assessment(sp)$id))) == 0L,
+  logical(1))))
+cat("CV folds: 5 | Client-leakage-free: TRUE\n")
+
+
+# =============================================================================
+# F: ENCODING HELPERS
+# =============================================================================
+
+recode_ordinals <- function(df) {
+  for (v in intersect(names(ordinal_levels), names(df)))
+    df[[v]] <- factor(df[[v]], levels = ordinal_levels[[v]], ordered = FALSE)
+  df
+}
+
+get_predictor_cols <- function(data, tgt)
+  setdiff(names(data), unique(c(always_exclude, premium_exclude, tgt)))
+
+encode_predictors <- function(train_df, test_df, tgt) {
+  pcols   <- get_predictor_cols(train_df, tgt)
+  x_tr    <- recode_ordinals(train_df[, pcols, drop=FALSE])
+  x_te    <- recode_ordinals(test_df[,  pcols, drop=FALSE])
+  rec     <- recipe(~., data=x_tr) %>%
+    step_novel(all_nominal_predictors()) %>%
+    step_unknown(all_nominal_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot=FALSE) %>%
+    step_zv(all_predictors())
+  prep_rec <- prep(rec, training=x_tr, retain=TRUE)
+  list(train=bake(prep_rec, new_data=NULL),
+       test =bake(prep_rec, new_data=x_te),
+       recipe=prep_rec)
+}
+
+# Shorthand constructors for glm/lm to avoid column-name conflicts
+fit_glm <- function(y, X, family) glm(resp__ ~ ., data=data.frame(resp__=y, X), family=family)
+fit_lm  <- function(y, X)         lm(resp__  ~ ., data=data.frame(resp__=y, X))
+
+
+# =============================================================================
+# G: METRIC HELPERS
+# =============================================================================
+
+rmse          <- function(obs, pred)  sqrt(mean((obs - pred)^2, na.rm=TRUE))
+mae           <- function(obs, pred)  mean(abs(obs - pred), na.rm=TRUE)
+pseudo_r2_glm <- function(fit)        1 - fit$deviance / fit$null.deviance
+r2_cor        <- function(obs, pred)  cor(obs, pred, use="complete.obs")^2
+gamma_dev     <- function(obs, pred)  2 * sum(obs/pred - log(obs/pred) - 1, na.rm=TRUE)
+ln_dev        <- function(obs, pred)  sum((log(obs) - log(pred))^2, na.rm=TRUE)
+binom_dev     <- function(y_bin, p) {
+  p <- pmax(pmin(p, 1-1e-10), 1e-10)
+  -2 * sum(y_bin * log(p) + (1 - y_bin) * log(1 - p))
+}
+gini_index <- function(obs, pred) {  # descending sort: Gini > 0 = good model
+  n   <- length(obs)
+  ord <- order(pred, decreasing=TRUE)
+  co  <- c(0, cumsum(obs[ord]) / sum(obs))
+  cp  <- seq(0, 1, length.out = n+1)
+  2 * sum(diff(cp) * (co[-1] + co[-(n+1)]) / 2) - 1
+}
+ln_backtr      <- function(pred_log, sigma) exp(pred_log + sigma^2 / 2)
+ll_lognormal   <- function(y, mu_log, sigma)
+  sum(dnorm(log(y), mean=mu_log, sd=sigma, log=TRUE) - log(y))
+cv_summary     <- function(tbl) list(
+  mean = colMeans(tbl, na.rm=TRUE),
+  se   = apply(tbl, 2, function(x) sd(x, na.rm=TRUE)/sqrt(sum(!is.na(x)))))
+
+# Consolidated severity metrics (return named vector).
+# pred_log: raw log-scale LN predictions for LN_Dev = RSS on the log scale.
+#           When NULL (Gamma model), LN_Dev falls back to ln_dev(y, pred).
+# r2:       r2_cor(obs, pred) on the original scale for all models and splits.
+sev_metrics <- function(y, pred, r2, aic, bic, pred_log = NULL) {
+  ln_dev_val <- if (!is.null(pred_log))
+                  sum((log(y) - pred_log)^2, na.rm = TRUE)
+                else
+                  ln_dev(y, pred)
+  c(R2        = round(r2, 4),
+    RMSE      = round(rmse(y, pred), 2),
+    MAE       = round(mae(y, pred),  2),
+    Gamma_Dev = round(gamma_dev(y, pred), 1),
+    LN_Dev    = round(ln_dev_val, 2),
+    Gini      = round(gini_index(y, pred), 4),
+    AIC       = round(aic, 0),
+    BIC       = round(bic, 0))
+}
+
+# AIC/BIC from a fitted LN model on original y scale (includes Jacobian)
+ln_aic_bic <- function(y, mu_log, sigma, p, n) {
+  ll  <- ll_lognormal(y, mu_log, sigma)
+  k   <- p + 1    # betas + sigma
+  c(AIC = -2*ll + 2*k, BIC = -2*ll + log(n)*k)
+}
+
+# AIC/BIC on test data using training-estimated parameters (Gamma)
+gamma_test_aic_bic <- function(y, pred, phi, k, n) {
+  shape <- 1/phi
+  ll    <- sum(dgamma(y, shape=shape, rate=shape/pred, log=TRUE))
+  c(AIC = -2*ll + 2*k, BIC = -2*ll + log(n)*k)
+}
+
+# Logistic test AIC/BIC
+logistic_test_aic_bic <- function(y_bin, pred, k, n) {
+  ll <- -binom_dev(y_bin, pred) / 2
+  c(AIC = -2*ll + 2*k, BIC = -2*ll + log(n)*k)
+}
+
+
+# =============================================================================
+# H: GOODNESS-OF-FIT TEST HELPER
+# =============================================================================
+
+# type: "gamma" | "lognormal" | "logistic"
+run_gof_tests <- function(fit, std_res, type=c("gamma","lognormal","logistic")) {
+  type <- match.arg(type)
+
+  # --- Pearson Chi-Squared ---
+  pears_stat <- switch(type,
+    gamma     = sum(residuals(fit, type="pearson")^2),
+    lognormal = sum(residuals(fit)^2) / sigma(fit)^2,
+    logistic  = sum(residuals(fit, type="pearson")^2))
+  df_p   <- fit$df.residual
+  pv_p   <- 1 - pchisq(pears_stat, df=df_p)
+
+  # --- Wald Test ---
+  n_coef  <- length(coef(fit))
+  wald    <- aod::wald.test(Sigma=vcov(fit), b=coef(fit), Terms=2:n_coef)
+  w_stat  <- wald$result$chi2["chi2"]
+  w_df    <- wald$result$chi2["df"]
+  w_pv    <- wald$result$chi2["P"]
+
+  # --- KS | AD | CvM ---
+  ks  <- ks.test(std_res, "pnorm", 0, 1)
+  ad  <- nortest::ad.test(std_res)
+  cvm <- goftest::cvm.test(std_res, "pnorm")
+
+  data.frame(
+    Test      = c("Pearson Chi-Sq","Wald Test","KS Test","Anderson-Darling","Cramer-von Mises"),
+    Statistic = round(c(pears_stat, w_stat, ks$statistic, ad$statistic, cvm$statistic), 4),
+    DF        = c(df_p, w_df, NA, NA, NA),
+    P_Value   = round(c(pv_p, w_pv, ks$p.value, ad$p.value, cvm$p.value), 4),
+    stringsAsFactors=FALSE)
+}
+
+# Lightweight GOF for VGAM Pareto (no Pearson/Wald via aod)
+run_gof_vglm <- function(fit, y_actual, y_pred) {
+  resid_std <- (y_actual - y_pred); resid_std <- (resid_std - mean(resid_std))/sd(resid_std)
+  ks  <- ks.test(resid_std, "pnorm", 0, 1)
+  ad  <- nortest::ad.test(resid_std)
+  cvm <- goftest::cvm.test(resid_std, "pnorm")
+  wald_stat <- wald_pv <- NA
+  tryCatch({
+    nc <- length(coef(fit))
+    w  <- aod::wald.test(Sigma=vcov(fit), b=coef(fit), Terms=2:nc)
+    wald_stat <- w$result$chi2["chi2"]; wald_pv <- w$result$chi2["P"]
+  }, error=function(e) NULL)
+  data.frame(
+    Test      = c("Wald Test","KS Test","Anderson-Darling","Cramer-von Mises"),
+    Statistic = round(c(wald_stat, ks$statistic, ad$statistic, cvm$statistic), 4),
+    P_Value   = round(c(wald_pv,   ks$p.value,   ad$p.value,   cvm$p.value),   4),
+    stringsAsFactors=FALSE)
+}
+
+
+# =============================================================================
+# I: PLOT HELPERS  (ggplot2)
+# =============================================================================
+
+th <- theme_minimal(base_size=11) +
+  theme(plot.title=element_text(face="bold", size=11))
+
+p_resid_v_fit <- function(fv, rv, lbl)
+  ggplot(data.frame(x=fv,y=rv), aes(x,y)) +
+    geom_point(size=.5, alpha=.3, colour="steelblue") +
+    geom_hline(yintercept=0, linetype="dashed", colour="red") +
+    geom_smooth(method="loess", se=FALSE, colour="orange", linewidth=.7, formula=y~x) +
+    labs(title=paste("Residuals vs Fitted —",lbl), x="Fitted", y="Deviance Residuals") + th
+
+p_hist_resid <- function(rv, lbl)
+  ggplot(data.frame(r=rv), aes(r)) +
+    geom_histogram(aes(y=after_stat(density)), bins=40, fill="steelblue",
+                   alpha=.6, colour="white") +
+    stat_function(fun=dnorm, args=list(mean=mean(rv),sd=sd(rv)),
+                  colour="red", linewidth=.9) +
+    labs(title=paste("Residuals Histogram —",lbl), x="Deviance Residuals", y="Density") + th
+
+p_qq <- function(rv, lbl)
+  ggplot(data.frame(r=rv), aes(sample=r)) +
+    stat_qq(size=.6, alpha=.45, colour="steelblue") + stat_qq_line(colour="red", linewidth=.8) +
+    labs(title=paste("Q-Q Plot —",lbl), x="Theoretical", y="Sample") + th
+
+p_pp <- function(sv, lbl) {  # sv = standardised residuals
+  n <- length(sv); s <- sort(sv)
+  ggplot(data.frame(th=pnorm(s,0,1), em=(seq_len(n)-.5)/n), aes(th,em)) +
+    geom_point(size=.5, alpha=.4, colour="steelblue") +
+    geom_abline(slope=1, intercept=0, colour="red", linetype="dashed") +
+    labs(title=paste("P-P Plot —",lbl), x="Theoretical P", y="Empirical P") + th
+}
+
+p_ave <- function(act, pred, lbl)
+  ggplot(data.frame(p=pred,a=act), aes(p,a)) +
+    geom_point(size=.5, alpha=.3, colour="steelblue") +
+    geom_abline(slope=1, intercept=0, colour="red", linetype="dashed", linewidth=.8) +
+    geom_smooth(method="loess", se=FALSE, colour="orange", linewidth=.8, formula=y~x) +
+    labs(title=paste("AvE Plot (Test) —",lbl), x="Expected", y="Actual") + th
+
+p_lift <- function(act, pred, lbl, nd=10) {
+  # 1. Create the summary data
+  df <- data.frame(a=act, p=pred) %>%
+    mutate(dec=dplyr::ntile(p, nd)) %>%
+    group_by(dec) %>%
+    summarise(Actual=mean(a), Predicted=mean(p), .groups="drop")
+  
+  # 2. Reshape for ggplot
+  dl <- data.frame(
+    Dec = rep(df$dec, 2),
+    Val = c(df$Actual, df$Predicted),
+    Ser = rep(c("Actual", "Predicted"), each=nrow(df))
+  )
+  
+  # 3. Plot with Bars AND Lines
+  ggplot(dl, aes(x = factor(Dec), y = Val, fill = Ser, group = Ser, color = Ser)) +
+    # The Bars
+    geom_bar(stat="identity", position="dodge", width=.7, alpha = 0.6) +
+    # The Connecting Lines
+    geom_line(size = 1) + 
+    # The Points on the lines
+    geom_point(size = 2) +
+    scale_fill_manual(values=c(Actual="steelblue", Predicted="coral")) +
+    scale_color_manual(values=c(Actual="steelblue", Predicted="coral")) +
+    labs(title=paste("Lift Chart (Test) —", lbl),
+         x="Decile (Low→High Predicted)", y="Mean Cost", fill="", color="") + 
+    th +
+    theme(legend.position="bottom")
+}
+
+save_diag_4 <- function(p1,p2,p3,p4, file, title_str) {
+  pdf(here(file), width=11, height=8.5)
+  gridExtra::grid.arrange(p1,p2,p3,p4, ncol=2,
+    top=grid::textGrob(title_str, gp=grid::gpar(fontsize=14, fontface="bold")))
+  dev.off(); cat("Saved:", file, "\n")
+}
+
+fmt_cv <- function(m, s, d=3) sprintf(paste0("%.",d,"f (\u00b1%.",d,"f)"), m, s)
+
+print_metrics_tbl <- function(tr_vec, te_vec, model_name, caption_str) {
+  tbl <- data.frame(Metric=names(tr_vec), Train=tr_vec, Test=te_vec,
+                    stringsAsFactors=FALSE)
+  cat("\n===", caption_str, "===\n")
+  print(kable(tbl, caption=caption_str,
+              col.names=c("Metric", paste(model_name,"Train"),
+                          paste(model_name,"Test")),
+              align=c("l","c","c"), row.names=FALSE))
+}
+
+
+# =============================================================================
+# J: SHARED FULL-CLAIMANT ENCODING
+# =============================================================================
+
+enc_sev   <- encode_predictors(train_sev, test_sev, target)
+X_tr_sev  <- enc_sev$train;  X_te_sev  <- enc_sev$test
+y_tr_sev  <- train_sev$avg_claim_cost
+y_te_sev  <- test_sev$avg_claim_cost
+n_tr_sev  <- length(y_tr_sev);  n_te_sev <- length(y_te_sev)
+ext_tr    <- y_tr_sev > THRESHOLD;  ext_te <- y_te_sev > THRESHOLD
+
+cat(sprintf("Attrition train: %d | Extreme train: %d\nAttrition test : %d | Extreme test : %d\n",
+            sum(!ext_tr), sum(ext_tr), sum(!ext_te), sum(ext_te)))
+
+# =============================================================================
+# 0: CROSS-VALIDATION EXECUTION (Pre-calculation)
+# =============================================================================
+cat("\n--- Running Cross-Validation: Traditional Models ---\n")
+
+cv_trad <- lapply(cv_folds$splits, function(sp) {
+  tr <- analysis(sp)   %>% filter(n_claims_year > 0)
+  va <- assessment(sp) %>% filter(n_claims_year > 0)
+  if (nrow(tr) == 0 || nrow(va) == 0) return(NULL)
+  
+  enc <- encode_predictors(tr, va, target)
+  ytr <- tr$avg_claim_cost; yva <- va$avg_claim_cost
+  
+  # Gamma
+  m_g   <- tryCatch(fit_glm(ytr, enc$train, Gamma(link="log")), error=function(e) NULL)
+  p_g   <- if (!is.null(m_g)) predict(m_g, enc$test, type="response") else rep(mean(ytr), length(yva))
+  phi_g <- summary(m_g)$dispersion
+  k_g   <- length(coef(m_g)) + 1   # +1 for dispersion parameter
+  n_g   <- length(yva)
+  ab_g  <- gamma_test_aic_bic(yva, p_g, phi_g, k_g, n_g)
+
+  # Log-Normal: pred_log_l = raw log-scale predictions; p_l = bias-corrected original-scale
+  m_l        <- tryCatch(fit_lm(log(ytr), enc$train), error=function(e) NULL)
+  sg         <- if (!is.null(m_l)) sigma(m_l) else sd(log(ytr))
+  pred_log_l <- if (!is.null(m_l)) predict(m_l, enc$test) else rep(mean(log(ytr)), length(yva))
+  p_l        <- ln_backtr(pred_log_l, sg)
+  k_l        <- length(coef(m_l))
+  n_l        <- length(yva)
+  ab_l       <- ln_aic_bic(yva, pred_log_l, sg, k_l, n_l)
+
+  data.frame(
+    Gamma_R2   = r2_cor(yva, p_g),
+    Gamma_RMSE = rmse(yva, p_g),
+    Gamma_MAE  = mae(yva, p_g),
+    Gamma_GDev = gamma_dev(yva, p_g),
+    Gamma_Gini = gini_index(yva, p_g),
+    Gamma_AIC  = ab_g["AIC"],
+    Gamma_BIC  = ab_g["BIC"],
+
+    LN_R2   = r2_cor(yva, p_l),
+    LN_RMSE = rmse(yva, p_l),
+    LN_MAE  = mae(yva, p_l),
+    LN_Dev  = sum((log(yva) - pred_log_l)^2),   # RSS on the log scale
+    LN_Gini = gini_index(yva, p_l),
+    LN_AIC  = ab_l["AIC"],
+    LN_BIC  = ab_l["BIC"]
+  )})
+
+cv_trad_tbl <- bind_rows(Filter(Negate(is.null), cv_trad))
+cv_trad_s   <- cv_summary(cv_trad_tbl) # Assuming this returns mean and se
+
+```
+
+
+# Exploring Relationship between Predictors and Targets
+
+## Correlation
+
+Spearman rank correlations between each predictor and avg_claim_cost are computed separately for the attritional and extreme claimant subsets. Using Spearman rather than Pearson correlation is deliberate: the target is heavily right-skewed and the predictors are a mix of ordinal bands and nominal categories encoded as integers, so a rank-based measure is more robust to the distributional shape of both variables. 
+
+```{r, echo=FALSE, fig.align='left'}
+# ----------------------------------------------------------
+# B) TARGET vs FEATURE CORRPLOT (avg_claim_cost only)
+# ----------------------------------------------------------
+
+# 1. Prepare the Severity-only dataframe
+severity_df <- basic_glm_data_no_na
+
+# 2. Add the classification
+severity_df$severity_classification <- ifelse(severity_df$avg_claim_cost > benchmark, 
+                                              "extreme", 
+                                              "attritional")
+
+# Define the single target variable for the Y-axis
+target_var <- "avg_claim_cost"
+
+# Define all variables that are 'results' rather than 'predictors'
+final_target_vars <- c(
+  "n_claims_year",
+  "avg_claim_cost",
+  "lapse_flag",
+  "days_to_event",
+  "severity_classification"
+)
+
+# Define variables to exclude (IDs, exposure, and targets)
+feature_vars <- setdiff(
+  names(severity_df), # Use the updated dataframe
+  c("id", "id2", "exposure_years", "premium_band", "premium_vs_median_band", final_target_vars)
+)
+
+severity_numeric <- severity_df 
+
+for (v in feature_vars) {
+  if (is.factor(severity_numeric[[v]])) {
+    severity_numeric[[v]] <- as.numeric(severity_numeric[[v]])
+  }
+  
+  if (is.character(severity_numeric[[v]])) {
+    severity_numeric[[v]] <- as.numeric(factor(severity_numeric[[v]]))
+  }
+}
+
+# --- NOW you can split and calculate correlations ---
+
+# 1. Split the NOW-NUMERIC data into two subsets
+attrit_data <- severity_numeric[severity_numeric$severity_classification == "attritional", ]
+extreme_data <- severity_numeric[severity_numeric$severity_classification == "extreme", ]
+
+# 2. Create the matrix
+target_names <- c("Attritional Severity", "Extreme Severity")
+target_feature_matrix <- matrix(
+  nrow = 2,
+  ncol = length(feature_vars),
+  dimnames = list(target_names, feature_vars)
+)
+
+# 3. Run the correlation loop
+for (f in feature_vars) {
+  target_feature_matrix[1, f] <- cor(attrit_data[[target_var]], attrit_data[[f]], 
+                                     method = "spearman", use = "pairwise.complete.obs")
+  
+  target_feature_matrix[2, f] <- cor(extreme_data[[target_var]], extreme_data[[f]], 
+                                     method = "spearman", use = "pairwise.complete.obs")
+}
+
+# 4. Plot the comparison
+corrplot(
+  target_feature_matrix,
+  is.corr = FALSE,
+  method = "color",
+  tl.col = "black",
+  tl.cex = 0.7,
+  tl.srt = 90,       # 45 is often easier to read than 90 for long feature names
+  cl.pos = "n",      # Put legend on the right for a 2-row plot
+  col = colorRampPalette(c("#2166AC", "white", "#B2182B"))(200),
+  mar = c(1, 1, 3, 1),
+  title = "Spearman Correlation: Red (+ve) and Blue (-ve)"
+)
+```
+
+```{r, echo=FALSE}
+# =============================================================================
+# VARIABLE TAXONOMY
+# =============================================================================
+
+one_hot_vars <- c(
+  "area_label", "channel_label", "payment_label", "second_driver_label",
+  "type_fuel", "seniority_category", "start_season", "start_day_of_week"
+)
+
+ord_vars <- c(
+  "age_category", "age_when_licensed_band", "driving_exp_category",
+  "vehicle_age_category", "power_band", "cylinder_band", "value_band",
+  "weight_band", "length_imputed_band", "n_doors_band",
+  # "claims_history_band"       # dropped: near-perfect collinearity
+  # "r_claims_history_band"     # dropped: near-perfect collinearity
+  "avg_claims_per_year_history_band", "cross_sell_ratio_band",
+  "policy_retention_rate_band", "risk_score_band"
+)
+
+binary_vars <- c(
+  "growing_portfolio", "had_previous_lapse", "multi_policy_holder",
+  "multi_product_holder", "start_weekend"
+)
+
+cat(sprintf(
+  "Predictor features: %d total  (%d nominal OHE | %d ordinal | %d binary)\n",
+  length(one_hot_vars) + length(ord_vars) + length(binary_vars),
+  length(one_hot_vars), length(ord_vars), length(binary_vars)
+))
+
+```
+
+## Standard Deviation from Mean (0)
+
+To make category-level patterns comparable across variables with very different cost scales, group means are standardised to z-scores within each severity classification. A bar sitting above zero indicates that the category is associated with above-average claim costs within that segment; a bar below zero indicates below-average. Plotting attritional and extreme bars side by side for each category reveals where the two segments agree (bars pointing in the same direction) and where they diverge (sign reversal), providing an intuitive visual overview of the variables that may be differentially predictive of extreme versus attritional outcomes.
+
+
+### Nominal Variables
+
+```{r, echo=FALSE}
+plot_zscore_severity <- function(data, var, target = "avg_claim_cost") {
+  
+  # 1. Calculate means per category and class
+  summary_df <- data %>%
+    group_by(!!sym(var), severity_classification) %>%
+    summarise(mean_sev = mean(!!sym(target), na.rm = TRUE), .groups = "drop")
+  
+  # 2. Apply Z-score Standardization within each classification
+  # (Value - Mean) / Standard Deviation
+  summary_df <- summary_df %>%
+    group_by(severity_classification) %>%
+    mutate(
+      z_sev = (mean_sev - mean(mean_sev)) / sd(mean_sev)
+    ) %>%
+    ungroup()
+
+  # 3. Plot
+  ggplot(summary_df, aes(x = factor(!!sym(var)), y = z_sev, fill = severity_classification)) +
+    geom_hline(yintercept = 0, color = "black", size = 0.5) + # Baseline at 0
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    scale_fill_manual(values = c("attritional" = "#377eb8", "extreme" = "#e41a1c")) +
+    labs(
+      title = paste(var),
+      x = NULL, 
+      y = NULL,
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      axis.text.x = element_text(size = 6, angle = 45, hjust = 1),
+      legend.position = "none"
+    )
+}
+
+# Apply using your updated severity_df
+ohe_vs_target_plots <- lapply(one_hot_vars, function(v) {
+  plot_zscore_severity(severity_df, v)
+})
+
+# Wrap the plots
+library(patchwork)
+wrap_plots(ohe_vs_target_plots) + 
+  plot_layout(ncol = 4, nrow = 2, guides = "collect") & 
+  theme(legend.position = "bottom")
+```
+
+
+### Ordinal Variables
+
+```{r, echo=FALSE}
+plot_ord_vs_target_zscore <- function(data, var, target = "avg_claim_cost") {
+  
+  # 1. Calculate means per category and class
+  summary_df <- data %>%
+    group_by(!!sym(var), severity_classification) %>%
+    summarise(mean_sev = mean(!!sym(target), na.rm = TRUE), .groups = "drop")
+  
+  # 2. Apply Z-score Standardization within each classification
+  summary_df <- summary_df %>%
+    group_by(severity_classification) %>%
+    mutate(z_sev = (mean_sev - mean(mean_sev)) / sd(mean_sev)) %>%
+    ungroup()
+
+  # 3. Plotting with a line to emphasize the ordinal trend
+  ggplot(summary_df, aes(x = factor(!!sym(var)), y = z_sev, fill = severity_classification)) +
+    geom_hline(yintercept = 0, color = "black", size = 0.5) +
+    # We keep the bars for consistency with your OHE plots
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    scale_fill_manual(values = c("attritional" = "#377eb8", "extreme" = "#e41a1c")) +
+    labs(
+      title = var, 
+      x = NULL, 
+      y = NULL,
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      axis.text.x = element_text(size = 6, angle = 90, vjust = 0.5, hjust = 1),
+      plot.title = element_text(size = 8, face = "bold", hjust = 0.5),
+      legend.position = "none",
+      panel.grid.major.x = element_blank(),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+}
+
+# Apply using the severity_df and your ordinal variables list
+ord_vs_target_plots <- lapply(ord_vars, function(v) {
+  plot_ord_vs_target_zscore(severity_df, v)
+})
+
+# Wrap the plots into a grid
+library(patchwork)
+wrap_plots(ord_vs_target_plots) + 
+  plot_layout(ncol = 5, nrow = 3, guides = "collect") & 
+  theme(legend.position = "bottom")
+```
+
+
+### Binary Variables
+
+```{r, echo=FALSE}
+plot_binary_vs_target_zscore <- function(data, var, target = "avg_claim_cost") {
+  
+  # 1. Calculate means per category (0/1 or T/F) and class
+  summary_df <- data %>%
+    group_by(!!sym(var), severity_classification) %>%
+    summarise(mean_sev = mean(!!sym(target), na.rm = TRUE), .groups = "drop")
+  
+  # 2. Apply Z-score Standardization within each classification
+  summary_df <- summary_df %>%
+    group_by(severity_classification) %>%
+    mutate(z_sev = (mean_sev - mean(mean_sev)) / sd(mean_sev)) %>%
+    ungroup()
+
+  # 3. Plot with symmetrical bars
+  ggplot(summary_df, aes(x = factor(!!sym(var)), y = z_sev, fill = severity_classification)) +
+    geom_hline(yintercept = 0, color = "black", size = 0.5) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.6) +
+    scale_fill_manual(values = c("attritional" = "#377eb8", "extreme" = "#e41a1c")) +
+    labs(
+      title = var, 
+      x = NULL, 
+      y = NULL
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      axis.text.x = element_text(size = 7),
+      plot.title = element_text(size = 10, face = "bold", hjust = 0.5),
+      legend.position = "none",
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+}
+
+# Apply to binary variables
+binary_vs_target_plots <- lapply(binary_vars, function(v) {
+  plot_binary_vs_target_zscore(severity_df, v)
+})
+
+# Wrap the plots
+wrap_plots(binary_vs_target_plots) + 
+  plot_layout(ncol = 3, nrow = 2, guides = "collect") & 
+  theme(legend.position = "bottom")
+```
+
+
+# Gamma Model
+
+The Gamma GLM with a log link is the actuarial industry standard for modelling claim severity. The Gamma family is chosen because it is defined on the positive real line, assumes a coefficient of variation that is constant across the range of fitted values (variance proportional to the square of the mean), and the log link ensures multiplicative effects on the cost scale — all properties consistent with insurance claim costs. The model is fitted on the claimant-only subsample (policies with n_claims_year > 0), since severity modelling conditions on a claim having occurred.
+
+
+
+```{r, echo=FALSE}
+# =============================================================================
+# K: TRADITIONAL — GAMMA GLM
+# =============================================================================
+cat("\n\n"); cat(strrep("=", 70)); cat("\nTRADITIONAL: GAMMA GLM\n"); cat(strrep("=", 70), "\n")
+
+gamma_fit <- fit_glm(y_tr_sev, X_tr_sev, Gamma(link="log"))
+cat("\n--- MODEL SUMMARY ---\n"); print(summary(gamma_fit))
+
+
+
+cat("\n--- PER-FOLD CV RESULTS (Gamma) ---\n")
+print(cv_trad_tbl %>% dplyr::select(starts_with("Gamma")))
+
+# Metric Calculation
+fv_gamma    <- fitted(gamma_fit)
+phi_gamma   <- summary(gamma_fit)$dispersion
+k_gamma     <- length(coef(gamma_fit)) + 1
+tr_gamma    <- sev_metrics(y_tr_sev, fv_gamma,
+                           r2_cor(y_tr_sev, fv_gamma),
+                           AIC(gamma_fit), BIC(gamma_fit))
+
+pred_gamma_te <- predict(gamma_fit, X_te_sev, type="response")
+te_ab_gamma   <- gamma_test_aic_bic(y_te_sev, pred_gamma_te, phi_gamma, k_gamma, n_te_sev)
+te_gamma <- sev_metrics(
+  y_te_sev,
+  pred_gamma_te,
+  r2_cor(y_te_sev, pred_gamma_te),
+  te_ab_gamma[["AIC"]],
+  te_ab_gamma[["BIC"]]
+)
+
+cat("\n--- CV MEAN +/- S.E. VS. TEST SCORES (Gamma) ---\n")
+gamma_cv_vs_te <- data.frame(
+  Metric  = c("R2 (Cor2)", "RMSE", "MAE", "Gamma_Dev", "Gini"),
+  CV_Mean = unname(cv_trad_s$mean[c("Gamma_R2","Gamma_RMSE","Gamma_MAE","Gamma_GDev","Gamma_Gini")]),
+  CV_SE   = unname(cv_trad_s$se[c("Gamma_R2","Gamma_RMSE","Gamma_MAE","Gamma_GDev","Gamma_Gini")]),
+  Test    = unname(te_gamma[c("R2", "RMSE", "MAE", "Gamma_Dev", "Gini")])
+)
+print(gamma_cv_vs_te)
+
+# Preparation for Diagnostics
+dev_res_gamma <- residuals(gamma_fit, type="deviance")
+std_res_gamma <- (dev_res_gamma - mean(dev_res_gamma)) / sd(dev_res_gamma)
+
+
+
+```
+\underline{Discussion:}
+
+The model identifies a small but interpretable set of significant predictors:
+
+- Age category shows the strongest and most consistent effect, with all age bands above 18–25 having similar positive coefficients (≈ 0.63–0.70).
+- Claimants aged 26+ incur roughly **exp(0.64) ≈ 1.90×** the claim cost of the youngest group.
+- The effect is stable across age bands and aligns with older drivers having **higher‑cost** claims despite lower claim frequency.
+
+Vehicle age acts in the opposite direction:
+
+- Vehicles aged 4–7 years show a coefficient of **−0.25** relative to new vehicles (0–3 years).
+- Vehicles aged 8–12 and 12+ years show coefficients of **−0.39** and **−0.45**, respectively.
+- Older vehicles therefore generate **lower average claim costs**, consistent with lower replacement value.
+
+Vehicle value band shows a clear positive gradient:
+
+- The highest value band (€32,500+) has a coefficient of **0.39 (p = 0.001)**.
+- This reflects that more expensive vehicles cost more to repair or replace.
+
+Prior lapse history contributes a meaningful cost loading:
+
+- A previous lapse adds approximately **0.25** to the log cost (p = 0.001).
+- Indicates a persistent severity effect beyond the frequency‑based selection of claimants.
+
+High risk score band (0.2+) shows a large but imprecise effect:
+
+- Coefficient of **0.61 (p = 0.015)**, the largest in the model.
+- Wide standard error (0.249) reflects sparsity in this band.
+
+Most remaining predictors are not statistically significant:
+
+- Cylinder, weight, length, doors, seniority, seasonal, and distribution channel variables show no meaningful effects.
+- Suggests claim severity is driven by a **narrower set of structural factors** than claim frequency.
+
+The dispersion parameter indicates substantial variability:
+
+- Dispersion of **8.13** implies a Gamma shape parameter of **≈ 0.12**, close to an exponential distribution.
+- Null deviance reduces only modestly (29,189 → 27,829), meaning the model explains **~4.7%** of total variation.
+
+Cross‑validation results show low but stable predictive power:
+
+- R² ranges from **0.0015 to 0.0051** (mean 0.0032 +/- 0.0006).
+- Gini ranges from **0.080 to 0.123** (mean 0.104 +/- 0.007).
+- RMSE varies widely (1,020–2,393) due to the presence or absence of a few very large claims in each fold.
+
+Hold‑out test performance aligns with CV expectations:
+
+- Test R² = **0.0070** and Gini = **0.1051**, both within the CV range.
+- Test RMSE = **1,102**, lower than the CV mean (1,609), driven by fold‑level variance rather than overfitting.
+- Test Gamma deviance = **6,988**, higher than the CV mean (5,796), though CV deviance is based on smaller fold sizes, limiting comparability.
+
+
+# Log-Normal Model
+
+The Log-Normal model fits an ordinary least squares regression on the natural logarithm of claim cost, exploiting the approximate normality of log(avg_claim_cost) that is visible in the zoomed distribution. Predictions are returned to the original cost scale using the smearing back-transformation exp(μ̂ + σ²/2), which corrects for the Jensen's inequality bias that would otherwise cause exp(μ̂) to systematically underestimate the conditional mean. The residual standard deviation σ is estimated from the training data and held fixed when generating test set predictions.
+
+
+```{r, echo=FALSE}
+# =============================================================================
+# L: TRADITIONAL — LOG-NORMAL
+# =============================================================================
+cat("\n\n"); cat(strrep("=", 70)); cat("\nTRADITIONAL: LOG-NORMAL\n"); cat(strrep("=", 70), "\n")
+
+ln_fit    <- fit_lm(log(y_tr_sev), X_tr_sev)
+sigma_ln  <- sigma(ln_fit)
+
+fv_ln_log <- fitted(ln_fit)                   # raw log-scale fitted values
+fv_ln     <- ln_backtr(fv_ln_log, sigma_ln)   # bias-corrected original-scale fitted values
+p_ln      <- length(coef(ln_fit))
+
+ab_tr_ln  <- ln_aic_bic(y_tr_sev, fv_ln_log, sigma_ln, p_ln, n_tr_sev)
+
+tr_ln <- sev_metrics(
+  y        = y_tr_sev,
+  pred     = fv_ln,
+  r2       = r2_cor(y_tr_sev, fv_ln),
+  aic      = ab_tr_ln[["AIC"]],
+  bic      = ab_tr_ln[["BIC"]],
+  pred_log = fv_ln_log
+)
+
+cat("\n--- MODEL SUMMARY ---\n"); print(summary(ln_fit))
+
+# Test metrics
+pred_ln_log_te <- predict(ln_fit, X_te_sev)              # raw log-scale test predictions
+pred_ln_te     <- ln_backtr(pred_ln_log_te, sigma_ln)    # bias-corrected for RMSE/MAE/Gini
+
+ab_te_ln <- { ll <- ll_lognormal(y_te_sev, pred_ln_log_te, sigma_ln)
+              c(AIC = -2*ll + 2*(p_ln+1), BIC = -2*ll + log(n_te_sev)*(p_ln+1)) }
+
+te_ln <- sev_metrics(
+  y        = y_te_sev,
+  pred     = pred_ln_te,
+  r2       = r2_cor(y_te_sev, pred_ln_te),
+  aic      = ab_te_ln[["AIC"]],
+  bic      = ab_te_ln[["BIC"]],
+  pred_log = pred_ln_log_te
+)
+
+cat("\n--- CV MEAN +/- S.E. VS. TEST SCORES (Log-Normal) ---\n")
+ln_cv_vs_te <- data.frame(
+  Metric  = c("R2 (Cor2)", "RMSE", "MAE", "LN_Dev [RSS_log]", "Gini"),
+  CV_Mean = unname(cv_trad_s$mean[c("LN_R2","LN_RMSE","LN_MAE","LN_Dev","LN_Gini")]),
+  CV_SE   = unname(cv_trad_s$se[c("LN_R2","LN_RMSE","LN_MAE","LN_Dev","LN_Gini")]),
+  Test    = unname(te_ln[c("R2", "RMSE", "MAE", "LN_Dev", "Gini")])
+)
+print(ln_cv_vs_te)
+
+# Preparation for Diagnostics
+res_ln     <- residuals(ln_fit)
+std_res_ln <- res_ln / sigma_ln
+
+
+```
+\underline{Discussion:}
+
+The Log-Normal model shows consistently stronger predictive performance than the Gamma:
+
+- CV R² averages **0.0051 (+/-0.0018)**, higher than the Gamma’s **0.0032**.
+- CV Gini averages **0.110 (+/-0.010)**, again above the Gamma’s **0.104**.
+- These improvements appear consistent across folds rather than driven by the test split.
+
+The corrected Log-Normal deviance behaves as expected:
+
+- LN_Dev (RSS on the log scale) averages **5,025** per fold (+/-70).
+- This scales proportionally to **6,195** on the full test set.
+- The metric is now correctly defined as the sum of squared log‑residuals.
+
+Hold-out test performance reinforces the Log-Normal advantage:
+
+- Test R² increases to **0.0118**, roughly double the Gamma’s **0.0070**.
+- Test Gini rises to **0.1462**, again nearly double the Gamma’s **0.1051**.
+- Test MAE = **443.8**, lower than the Gamma’s **470.0**, indicating better median accuracy across the bulk of claims.
+
+
+
+# Training Evaluation
+
+The training metrics serve as a baseline to assess in-sample fit and to anchor the comparison with cross-validation and test performance. Two deviance metrics are reported for each model: Gamma_Dev (= 2Σ(y/ŷ − log(y/ŷ) − 1), the scaled deviance of the Gamma GLM) and LN_Dev (= Σ(log y − log ŷ)², the residual sum of squares on the log scale that the Log-Normal model directly minimises). These are fundamentally different functions and are reported separately for transparency — they should not be compared across model columns. All R² figures throughout this document are computed as the squared Pearson correlation between observed and fitted values on the original cost scale, cor(y, ŷ)², ensuring the metric is directly comparable across the Gamma and Log-Normal models and across training, cross-validation, and test splits.
+
+
+
+```{r, echo=FALSE}
+# =============================================================================
+# # Training Evaluation
+# =============================================================================
+cat("\n\n# Training Evaluation\n")
+
+train_eval_tbl <- data.frame(
+  Metric     = c("R2 (Cor2)", "RMSE", "MAE", "Gamma_Dev", "LN_Dev [RSS_log]", "Gini"),
+  Gamma_GLM  = unname(tr_gamma[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")]),
+  Log_Normal = unname(tr_ln[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")])
+)
+print(train_eval_tbl)
+```
+\underline{Discussion:}
+
+The Gamma shows slightly stronger in-sample correlation but does not generalise as well:
+- Training R²: Gamma **0.0087** vs Log-Normal **0.0044**, reflecting Gamma’s flexibility on the original scale.
+- This advantage disappears out of sample: test R² reverses to Gamma **0.0070** vs Log-Normal **0.0118**, indicating mild overfitting by the Gamma.
+
+The Log-Normal provides better in-sample accuracy on the median scale:
+- Training MAE: Log-Normal **461.2** vs Gamma **484.3**, meaning LN back-transformed predictions sit closer to observed costs on average.
+
+Log-domain fit clearly favours the Log-Normal:
+- LN_Dev (RSS on log scale) = **24,904**, the actual quantity minimised by the Log-Normal.
+- Applying the same log-squared-error metric to Gamma predictions yields **38,218**, confirming the Log-Normal’s superior fit in the log domain.
+
+The Gamma ranks claimants better in-sample but overfits this ordering:
+- Training Gini: Gamma **0.1715** vs Log-Normal **0.1249**, indicating stronger in-sample ranking performance.
+- This reverses on the test set: Gamma **0.1051** vs Log-Normal **0.1462**, a clear sign that the Gamma’s ranking relies on training-specific noise.
+
+
+# Test Evaluation
+
+The hold-out test set — comprising 3,788 policies across 3,021 clients not seen during training — provides an unbiased estimate of generalisation performance. Because the test R² is computed on the same cor(y, ŷ)² basis as the training and CV figures, any deterioration between training and test directly reflects overfitting. 
+
+```{r, echo=FALSE}
+cat("\n\n# Test Evaluation\n")
+
+# =============================================================================
+# # Test Evaluation
+# =============================================================================
+test_eval_tbl <- data.frame(
+  Metric     = c("R2 (Cor2)", "RMSE", "MAE", "Gamma_Dev", "LN_Dev [RSS_log]", "Gini"),
+  Gamma_GLM  = unname(te_gamma[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")]),
+  Log_Normal = unname(te_ln[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")])
+)
+print(test_eval_tbl)
+```
+\underline{Discussion:}
+
+The test set provides the most reliable basis for comparing the two models:
+
+- The Log-Normal outperforms the Gamma on all key metrics:  
+  **R²** (0.0118 vs 0.0070), **MAE** (443.8 vs 470.0), **Gini** (0.1462 vs 0.1051), and **LN_Dev** (6,195 vs 9,646).
+- These improvements indicate stronger discrimination, better calibration, and closer median predictions for the Log-Normal.
+
+The Gamma shows substantial deterioration in ranking ability out of sample:
+
+- Training Gini drops from **0.1715 → 0.1051**, a **39% decline**.
+- The Log-Normal’s Gini declines more modestly (**0.1249 → 0.1462**, a 17% change in the opposite direction).
+- This contrast suggests the Gamma overfits the severity ranking, while the Log-Normal generalises more robustly.
+
+RMSE shows little difference between the models:
+
+- Test RMSE is nearly identical (Gamma **1,102** vs Log-Normal **1,099**).
+- This reflects RMSE being dominated by a few extreme claims that neither model captures well.
+
+Gamma deviance provides a useful cross-diagnostic:
+
+- The Log-Normal’s Gamma deviance (**6,866**) is slightly lower than the Gamma GLM’s own (**6,988**).
+- This indicates that the Log-Normal’s original-scale predictions are at least as well-calibrated under a Gamma loss.
+
+Overall, the Log-Normal is the preferred model based on test set performance.
+
+
+# Goodness-of-Fit Tests
+
+Five tests are applied to the standardised residuals of each model. The Pearson Chi-Squared test assesses whether the overall residual variance is consistent with the assumed distributional family; a statistic far exceeding the degrees of freedom signals distributional misspecification. The Wald test jointly tests whether the predictor coefficients are all zero, providing a global assessment of model utility. The Kolmogorov-Smirnov, Anderson-Darling, and Cramér-von Mises tests each assess whether the standardised residuals conform to a standard normal distribution — a necessary condition for the assumed error structure to hold. The Anderson-Darling test places greater weight on the tails and is therefore particularly informative for heavy-tailed residuals. 
+
+
+```{r, echo=FALSE}
+# =============================================================================
+# # Goodness-of-Fit Tests
+# =============================================================================
+cat("\n\n# Goodness-of-Fit Tests\n")
+
+cat("\n--- Gamma GLM (Train) ---\n")
+gof_gamma <- run_gof_tests(gamma_fit, std_res_gamma, "gamma"); print(gof_gamma)
+
+cat("\n--- Log-Normal (Train) ---\n")
+gof_ln <- run_gof_tests(ln_fit, std_res_ln, "lognormal"); print(gof_ln)
+
+# Visual Diagnostics
+pg <- list(p_resid_v_fit(log(fv_gamma), dev_res_gamma, "Gamma GLM"),
+           p_hist_resid(dev_res_gamma, "Gamma GLM"),
+           p_qq(dev_res_gamma, "Gamma GLM"),
+           p_pp(std_res_gamma, "Gamma GLM"))
+save_diag_4(pg[[1]], pg[[2]], pg[[3]], pg[[4]], 
+            "severity_diagnostics_train_gamma.pdf", "Gamma GLM — Training Diagnostics")
+
+pl <- list(p_resid_v_fit(fv_ln_log, res_ln, "Log-Normal"),
+           p_hist_resid(res_ln, "Log-Normal"),
+           p_qq(res_ln, "Log-Normal"),
+           p_pp(std_res_ln, "Log-Normal"))
+save_diag_4(pl[[1]], pl[[2]], pl[[3]], pl[[4]], 
+            "severity_diagnostics_train_lognormal.pdf", "Log-Normal — Training Diagnostics")
+```
+
+\underline{Discussion:}
+
+The Gamma GLM shows severe distributional misspecification:
+
+- Pearson Chi-Squared = **122,818** on 15,106 df, around **8×** the expected value, giving p = 0.
+- This indicates the residual variance is eight times larger than the Gamma family assumes — a catastrophic failure of the distributional form.
+- Normality tests on standardised residuals (KS, AD, CvM) all return p = 0.
+- The Anderson–Darling statistic of **338.5** shows the right tail is dramatically heavier than the Gamma model allows.
+
+The Log-Normal passes the key distributional checks:
+
+- Pearson Chi-Squared = **15,106** on 15,106 df, p = 0.499 — exactly what is expected under a correctly specified model.
+- This provides strong evidence that the log-normal assumption fits the bulk of the data well.
+
+The predictor set is jointly significant under the Log-Normal:
+
+- Wald test: χ² = **695.4** on 49 df, p = 0.
+- This is far larger than the Gamma’s χ² = 154.4, reflecting a better-conditioned likelihood and stronger explanatory power.
+
+Residual distribution tests still reject perfect normality for the Log-Normal:
+
+- KS = **0.059**, AD = **67.1**, CvM = **12.1**, all p < 0.001.
+- At n = 15,156, even small deviations trigger rejection, so this is expected.
+- Crucially, the magnitudes are **dramatically smaller** than for the Gamma — AD drops from 338.5 to 67.1, a **fivefold improvement**.
+- This indicates the Log-Normal residuals are substantially closer to the assumed normal form.
+
+
+
+# Visual Diagnosis Plots
+
+## Goodness-of-Fit Plots
+
+Four paired diagnostic plots compare the Gamma GLM (left) and Log-Normal (right) on the training data. The Residuals vs Fitted plot should show points scattered randomly around zero with a flat LOESS smoother; any upward trend or fan shape indicates heteroscedasticity or mean misspecification. The Residuals Histogram overlays a fitted normal curve on the empirical residual density; a good fit implies the assumed error distribution is appropriate. The Q-Q plot maps empirical quantiles against theoretical normal quantiles; departure from the diagonal, especially in the tails, indicates distributional misfit. The P-P plot maps the empirical cumulative distribution against the theoretical; an S-shaped departure indicates the model systematically underestimates or overestimates residual probabilities in different regions of the distribution. 
+
+
+```{r gof-diag-plots, fig.width=14, fig.height=6, message=FALSE, echo=FALSE}
+# pg (Gamma) and pl (Log-Normal) were already built in the Goodness-of-Fit Tests
+# chunk above. No need to rebuild pl or call save_diag_4 a second time here.
+
+library(patchwork)
+
+plot_types <- c("Residuals vs Fitted", "Histogram of Residuals", "Q-Q Plot", "P-P Plot")
+
+for(i in 1:4) {
+  combined_plot <- pg[[i]] + pl[[i]] +
+    plot_annotation(
+      title    = paste("Diagnostic Comparison:", plot_types[i]),
+      subtitle = "Left: Gamma GLM | Right: Log-Normal"
+    )
+  print(combined_plot)
+}
+```
+
+
+\underline{Discussion:}
+
+Residuals vs Fitted plots highlight clear differences between the models:
+
+- The Gamma plot shows deviance residuals fanning upward with fitted values, and a LOESS line that rises steadily — evidence that the assumed variance function (∝ μ²) fails to stabilise residuals.
+- The Log-Normal plot shows a tighter band around zero and a flatter LOESS line, with only mild upward drift at high fitted values, indicating residual heteroscedasticity mainly in the extreme-cost region.
+
+Histogram of residuals shows stark contrast in distributional fit:
+
+- The Gamma histogram is sharply right-skewed, with mass near zero and a long positive tail extending beyond 20 standard deviations — completely inconsistent with the normal overlay.
+- The Log-Normal histogram is approximately bell-shaped and aligns closely with the normal curve, with only slight right-tail asymmetry, consistent with its acceptable Pearson test result.
+
+Q-Q plots reveal tail behaviour differences:
+
+- The Gamma Q-Q plot diverges dramatically from the diagonal beyond theoretical quantile 2, with sample quantiles reaching ~20 vs theoretical ~4 — a **5:1 tail inflation**.
+- The Log-Normal Q-Q plot tracks the diagonal through the centre, with mild S-shaped deviation at both ends.  
+  The positive tail reaches ~5 vs theoretical ~4, reflecting underestimation of extreme claims — consistent with a possible two-regime severity structure.
+
+P-P plots show similar qualitative patterns but different magnitudes:
+
+- Both models display an S-shaped deviation: empirical CDF lags in the lower tail, overshoots in the mid-range, and reconverges in the upper tail — the signature of a distribution that is slightly too peaked and heavy-tailed relative to normality.
+- The Log-Normal’s S-curve is **much shallower** than the Gamma’s, indicating a better-calibrated probability structure across the full residual range.
+
+
+## Predictive Performance Plots
+
+Two further paired plots evaluate out-of-sample predictive performance on the test set. The Actual vs Expected (AvE) plot plots observed costs against model predictions at the individual policy level; the ideal is a cloud of points distributed symmetrically around the 45° diagonal. Systematic departure from the diagonal — for example, the orange LOESS line lying consistently above or below — indicates directional bias in the predictions. The Lift chart ranks test policies into ten deciles by predicted cost (low to high) and compares the mean actual cost per decile against the mean predicted cost. A well-calibrated model produces actual and predicted bars that track closely across all deciles, and a monotonically increasing actual line confirms that higher predictions genuinely correspond to higher observed costs. The Log-Normal model shows smoother separation and tighter calibration across deciles, consistent with its superior Gini coefficient on the test set.
+
+```{r traditional-ave-lift, fig.width=14, fig.height=10, message=FALSE, echo=FALSE}
+library(patchwork)
+
+# 1. Generate the individual plots
+p1 <- p_ave(y_te_sev, pred_gamma_te, "Gamma GLM")
+p2 <- p_ave(y_te_sev, pred_ln_te,    "Log-Normal")
+p3 <- p_lift(y_te_sev, pred_gamma_te, "Gamma GLM")
+p4 <- p_lift(y_te_sev, pred_ln_te,    "Log-Normal")
+
+
+# 1. Pair up the AvE plots (Gamma vs Log-Normal)
+ave_combined <- p1 + p2 + 
+  plot_annotation(
+    title = "Diagnostic Comparison: Actual vs Expected",
+    subtitle = "Left: Gamma GLM | Right: Log-Normal",
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+# 2. Pair up the Lift plots (Gamma vs Log-Normal)
+lift_combined <- p3 + p4 + 
+  plot_annotation(
+    title = "Diagnostic Comparison: Lift Charts",
+    subtitle = "Left: Gamma GLM | Right: Log-Normal",
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+# 3. Print them
+print(ave_combined)
+print(lift_combined)
+```
+
+\underline{Discussion:}
+
+The AvE plots highlight the limits of point prediction for both models:
+
+- In both Gamma and Log-Normal, the scatter extends vertically up to **€20,000** while fitted values remain tightly compressed  
+  (Gamma: €200–€1,600; Log-Normal: €200–€900).
+- This reflects extreme claim heterogeneity that neither model can capture with mean predictions.
+- The LOESS line in both plots sits slightly above the 45° reference line, indicating **systematic underestimation** of average actual costs — consistent with heavy-tail exposure that single-distribution GLMs smooth over.
+
+Lift charts show clearer separation and stability for the Log-Normal:
+
+- The Gamma lift chart is erratic in the lower and middle deciles (especially deciles 2–5), with actual and predicted lines crossing multiple times before aligning in the top decile.
+- The Log-Normal lift chart shows smoother, more monotonic behaviour, with actual and predicted values tracking more consistently across all deciles.
+- In both models, the top decile shows predicted means (~€600–€650) well below actual means (~€800), reflecting **persistent underprediction of the highest-severity segment** — a structural limitation of single-distribution GLM severity models under extreme right tails.
+
+---
+
+# Hurdle Frameworks
+
+The hurdle framework decomposes the severity distribution into two distinct stages. In the first stage, a binary classifier identifies whether a claimant's cost exceeds the extreme threshold of €900 — the boundary established in the data exploration section, at or below which approximately 91% of claimants fall. In the second stage, separate distributional models are fitted independently to each segment: attritional claims (avg_claim_cost ≤ €900) and extreme claims (avg_claim_cost > €900). This stratified approach allows each sub-model to exploit within-segment distributional structure more effectively than a single-distribution model applied to the full, heavy-tailed severity distribution. The binary classification component uses the same full-claimant training set as the traditional models. All severity components use segment-specific training subsets, with encoding, cross-validation structure, and train–test split inherited from the same infrastructure established in the Data Pre-processing section.
+
+
+```{r hurdle-precomp, include=FALSE}
+
+# =============================================================================
+# HURDLE FRAMEWORK PRE-COMPUTATION
+# Subsets, encoding, helper functions, and 5-fold grouped CV for all five
+# hurdle components.
+# =============================================================================
+
+
+# Binary integer targets: 1 = extreme (cost > THRESHOLD), 0 = attritional
+y_bin_tr <- as.integer(ext_tr)
+y_bin_te <- as.integer(ext_te)
+
+# Attritional sub-datasets and encoding
+train_att <- train_sev %>% filter(avg_claim_cost <= THRESHOLD)
+test_att  <- test_sev  %>% filter(avg_claim_cost <= THRESHOLD)
+enc_att   <- encode_predictors(train_att, test_att, target)
+X_tr_att  <- enc_att$train;   X_te_att <- enc_att$test
+y_tr_att  <- train_att$avg_claim_cost
+y_te_att  <- test_att$avg_claim_cost
+n_tr_att  <- length(y_tr_att);  n_te_att <- length(y_te_att)
+
+# Extreme sub-datasets and encoding
+train_ext <- train_sev %>% filter(avg_claim_cost > THRESHOLD)
+test_ext  <- test_sev  %>% filter(avg_claim_cost > THRESHOLD)
+enc_ext   <- encode_predictors(train_ext, test_ext, target)
+X_tr_ext  <- enc_ext$train;   X_te_ext <- enc_ext$test
+y_tr_ext  <- train_ext$avg_claim_cost
+y_te_ext  <- test_ext$avg_claim_cost
+n_tr_ext  <- length(y_tr_ext);  n_te_ext <- length(y_te_ext)
+
+cat(sprintf(
+  "Hurdle subsets:\n  Binary (full claimants): %d train / %d test\n  Attritional: %d train / %d test\n  Extreme    : %d train / %d test\n",
+  length(y_bin_tr), length(y_bin_te),
+  n_tr_att, n_te_att, n_tr_ext, n_te_ext))
+
+# Binary model metric helper
+bin_metrics <- function(y_bin, p, aic, bic)
+  c(
+    R2        = round(r2_cor(as.numeric(y_bin), p), 4),
+    RMSE      = round(rmse(as.numeric(y_bin), p), 4),
+    Brier     = round(mean((as.numeric(y_bin) - p)^2, na.rm = TRUE), 4),
+    MAE       = round(mae(as.numeric(y_bin), p), 4),
+    Binom_Dev = round(binom_dev(as.numeric(y_bin), p), 1),
+    AUC       = round(as.numeric(pROC::auc(pROC::roc(as.integer(y_bin), p,
+                                                      quiet = TRUE))), 4),
+    Gini      = round(gini_index(as.numeric(y_bin), p), 4),
+    AIC       = round(aic, 0),
+    BIC       = round(bic, 0)
+  )
+
+ll_gamma <- function(y, mu, phi) {
+  sum(dgamma(y, shape = 1/phi, scale = mu * phi, log = TRUE))
+}
+
+gamma_test_aic_bic <- function(y, pred_mu, phi, k, n) {
+  ll <- ll_gamma(y, pred_mu, phi)
+  c(AIC = -2 * ll + 2 * k, BIC = -2 * ll + log(n) * k)
+}
+
+# =============================================================================
+# HURDLE CV: 5-FOLD CLIENT-GROUPED CROSS-VALIDATION
+# =============================================================================
+
+cat("\n--- Running Cross-Validation: Hurdle Models ---\n")
+
+cv_hurdle <- lapply(cv_folds$splits, function(sp) {
+  tr_all <- analysis(sp)   %>% filter(n_claims_year > 0)
+  va_all <- assessment(sp) %>% filter(n_claims_year > 0)
+  if (nrow(tr_all) < 10 || nrow(va_all) < 5) return(NULL)
+
+  yb_tr <- as.integer(tr_all$avg_claim_cost > THRESHOLD)
+  yb_va <- as.integer(va_all$avg_claim_cost > THRESHOLD)
+  tr_a  <- tr_all %>% filter(avg_claim_cost <= THRESHOLD)
+  va_a  <- va_all %>% filter(avg_claim_cost <= THRESHOLD)
+  tr_e  <- tr_all %>% filter(avg_claim_cost >  THRESHOLD)
+  va_e  <- va_all %>% filter(avg_claim_cost >  THRESHOLD)
+
+  enc_all <- encode_predictors(tr_all, va_all, target)
+
+  # --- Binary logistic ---
+  m_bin <- tryCatch(fit_glm(yb_tr, enc_all$train, binomial()), error = function(e) NULL)
+  p_bin <- if (!is.null(m_bin)) predict(m_bin, enc_all$test, type = "response") else rep(mean(yb_tr), length(yb_va))
+
+  # --- Attritional models ---
+  has_a <- nrow(tr_a) > 10 && nrow(va_a) > 0
+  p_ga <- p_la <- pl_a <- yva_a <- numeric(0)
+  if (has_a) {
+    enc_a <- encode_predictors(tr_a, va_a, target)
+    ytr_a <- tr_a$avg_claim_cost;  yva_a <- va_a$avg_claim_cost
+    # Gamma (attritional)
+    m_ga  <- tryCatch(fit_glm(ytr_a, enc_a$train, Gamma(link = "log")), error = function(e) NULL)
+    p_ga  <- if (!is.null(m_ga)) predict(m_ga, enc_a$test, type = "response") else rep(mean(ytr_a), length(yva_a))
+    # Log-Normal (attritional)
+    m_la  <- tryCatch(fit_lm(log(ytr_a), enc_a$train), error = function(e) NULL)
+    sg_a  <- if (!is.null(m_la)) sigma(m_la) else sd(log(ytr_a))
+    pl_a  <- if (!is.null(m_la)) predict(m_la, enc_a$test) else rep(mean(log(ytr_a)), length(yva_a))
+    p_la  <- ln_backtr(pl_a, sg_a)
+  }
+
+    has_e <- nrow(tr_e) > 10 && nrow(va_e) > 0
+    p_ge <- p_le <- pl_e <- yva_e <- numeric(0)
+    if (has_e) {
+      enc_e   <- encode_predictors(tr_e, va_e, target)
+      ytr_e   <- tr_e$avg_claim_cost;  yva_e <- va_e$avg_claim_cost
+
+      # Gamma (extreme)
+      m_ge  <- tryCatch(fit_glm(ytr_e, enc_e$train, Gamma(link = "log")), error = function(e) NULL)
+      p_ge  <- if (!is.null(m_ge)) predict(m_ge, enc_e$test, type = "response") else rep(mean(ytr_e), length(yva_e))
+
+      # Log-Normal (extreme)
+      m_le  <- tryCatch(fit_lm(log(ytr_e), enc_e$train), error = function(e) NULL)
+      sg_e  <- if (!is.null(m_le)) sigma(m_le) else sd(log(ytr_e))
+      pl_e  <- if (!is.null(m_le)) predict(m_le, enc_e$test) else rep(mean(log(ytr_e)), length(yva_e))
+      p_le  <- ln_backtr(pl_e, sg_e)
+    }
+
+  data.frame(
+    # Binary component
+    Bin_Brier = mean((as.numeric(yb_va) - p_bin)^2, na.rm = TRUE),
+    Bin_RMSE  = rmse(yb_va, p_bin),
+    Bin_MAE   = mae(yb_va, p_bin),
+    Bin_Dev   = binom_dev(yb_va, p_bin),
+    Bin_AUC   = tryCatch(as.numeric(pROC::auc(pROC::roc(as.integer(yb_va), p_bin,
+                                                         quiet = TRUE))),
+                         error = function(e) NA_real_),
+    Bin_Gini  = tryCatch(gini_index(as.numeric(yb_va), p_bin), error = function(e) NA_real_),
+    # Gamma – attritional
+    GAtt_R2   = if (has_a) r2_cor(yva_a, p_ga)          else NA_real_,
+    GAtt_RMSE = if (has_a) rmse(yva_a, p_ga)            else NA_real_,
+    GAtt_MAE  = if (has_a) mae(yva_a, p_ga)             else NA_real_,
+    GAtt_Dev  = if (has_a) gamma_dev(yva_a, p_ga)       else NA_real_,
+    GAtt_Gini = if (has_a) gini_index(yva_a, p_ga)      else NA_real_,
+    # Log-Normal – attritional
+    LNAtt_R2   = if (has_a) r2_cor(yva_a, p_la)                                      else NA_real_,
+    LNAtt_RMSE = if (has_a) rmse(yva_a, p_la)                                        else NA_real_,
+    LNAtt_MAE  = if (has_a) mae(yva_a, p_la)                                         else NA_real_,
+    LNAtt_Dev  = if (has_a && length(pl_a) > 0) sum((log(yva_a) - pl_a)^2)          else NA_real_,
+    LNAtt_Gini = if (has_a) gini_index(yva_a, p_la)                                  else NA_real_,
+    # Gamma – extreme
+    GExt_R2   = if (has_e) r2_cor(yva_e, p_ge)          else NA_real_,
+    GExt_RMSE = if (has_e) rmse(yva_e, p_ge)            else NA_real_,
+    GExt_MAE  = if (has_e) mae(yva_e, p_ge)             else NA_real_,
+    GExt_Dev  = if (has_e) gamma_dev(yva_e, p_ge)       else NA_real_,
+    GExt_Gini = if (has_e) gini_index(yva_e, p_ge)      else NA_real_,
+    # Log-Normal – extreme
+    LNExt_R2   = if (has_e) r2_cor(yva_e, p_le)                                      else NA_real_,
+    LNExt_RMSE = if (has_e) rmse(yva_e, p_le)                                        else NA_real_,
+    LNExt_MAE  = if (has_e) mae(yva_e, p_le)                                         else NA_real_,
+    LNExt_Dev  = if (has_e && length(pl_e) > 0) sum((log(yva_e) - pl_e)^2)          else NA_real_,
+    LNExt_Gini = if (has_e) gini_index(yva_e, p_le)                                  else NA_real_
+  )
+})
+
+cv_hurdle_tbl <- dplyr::bind_rows(Filter(Negate(is.null), cv_hurdle))
+cv_hurdle_s   <- cv_summary(cv_hurdle_tbl)
+cat("Hurdle CV complete.\n")
+```
+
+
+## Binary Component - Logistic Regression (Claims Classification)
+
+The binary classifier determines whether a claimant's average cost exceeds the €900 threshold, partitioning the claimant population into attritional and extreme segments. The model is fitted as a binomial GLM with a logit link on the full claimant training set, using the same predictor matrix as the traditional severity models. A predicted probability above 0.5 would indicate an extreme classification, though the primary use of this model is to produce calibrated probabilities for weighting predictions from the two severity sub-models downstream. Two metrics are introduced that are specific to classification problems. First, Binomial Deviance is defined as $-2\sum[y_i \log(\hat{p}_i) + (1-y_i)\log(1-\hat{p}_i)]$ and directly measures the log-likelihood loss under the binomial assumption — lower is better. Second, AUC (Area Under the ROC Curve) measures the probability that a randomly chosen extreme claimant is assigned a higher predicted probability than a randomly chosen attritional claimant; it ranges from 0.5 (random) to 1.0 (perfect separation) and is independent of the classification threshold. Note that AUC and Gini are monotonically related by Gini = 2 × AUC − 1, so they carry the same rank-ordering information but on different scales. All other metrics (RMSE, MAE) are computed on the probability scale and are consistent with the framework used throughout this document.
+
+```{r hurdle-binary, echo=FALSE}
+
+cat("\n\n"); cat(strrep("=", 70))
+cat("\nHURDLE COMPONENT 1: BINARY LOGISTIC REGRESSION\n"); cat(strrep("=", 70), "\n")
+
+# Fit
+bin_fit <- fit_glm(y_bin_tr, X_tr_sev, binomial(link = "logit"))
+
+cat("\n--- MODEL SUMMARY ---\n")
+print(summary(bin_fit))
+
+# Train
+fv_bin <- fitted(bin_fit)
+k_bin  <- length(coef(bin_fit))
+
+tr_bin <- bin_metrics(
+  y_bin_tr,
+  fv_bin,
+  AIC(bin_fit),
+  BIC(bin_fit)
+)
+
+# Test
+pred_bin_te <- predict(bin_fit, X_te_sev, type = "response")
+
+ab_te_bin <- logistic_test_aic_bic(
+  y_bin_te,
+  pred_bin_te,
+  k_bin,
+  n_te_sev
+)
+
+te_bin <- bin_metrics(
+  y_bin_te,
+  pred_bin_te,
+  ab_te_bin["AIC"],
+  ab_te_bin["BIC"]
+)
+
+# ── Consolidated training & test table ────────────────────────────────────────
+cat("\n--- TRAINING & TEST METRICS (Binary Logistic) ---\n")
+tbl_bin <- data.frame(
+  Metric = c(
+    "R2 (Cor2)",
+    "RMSE",
+    "Brier Score",
+    "MAE",
+    "Binomial Deviance",
+    "AUC",
+    "Gini"
+  ),
+
+  Binary_Train = unname(tr_bin[
+    c("R2","RMSE","Brier","MAE","Binom_Dev","AUC","Gini")
+  ]),
+
+  Binary_Test = unname(te_bin[
+    c("R2","RMSE","Brier","MAE","Binom_Dev","AUC","Gini")
+  ])
+)
+
+print(kable(tbl_bin,
+            col.names = c("Metric", "Train", "Test"),
+            align = c("l","c","c"),
+            row.names = FALSE))
+
+# ── CV vs Test comparison ──────────────────────────────────────────────────────
+cat("\n--- CV VS TEST COMPARISON (Binary Logistic) ---\n")
+cvte_bin <- data.frame(
+  Metric = c(
+    "RMSE",
+    "Brier Score",
+    "MAE",
+    "Binomial Deviance",
+    "AUC",
+    "Gini"
+  ),
+
+  CV_Mean_SE = c(
+    fmt_cv(cv_hurdle_s$mean["Bin_RMSE"],  cv_hurdle_s$se["Bin_RMSE"]),
+    fmt_cv(cv_hurdle_s$mean["Bin_Brier"], cv_hurdle_s$se["Bin_Brier"]),
+    fmt_cv(cv_hurdle_s$mean["Bin_MAE"],   cv_hurdle_s$se["Bin_MAE"]),
+    fmt_cv(cv_hurdle_s$mean["Bin_Dev"],   cv_hurdle_s$se["Bin_Dev"]),
+    fmt_cv(cv_hurdle_s$mean["Bin_AUC"],   cv_hurdle_s$se["Bin_AUC"]),
+    fmt_cv(cv_hurdle_s$mean["Bin_Gini"],  cv_hurdle_s$se["Bin_Gini"])
+  ),
+
+  Test = c(
+    te_bin["RMSE"],
+    te_bin["Brier"],
+    te_bin["MAE"],
+    te_bin["Binom_Dev"],
+    te_bin["AUC"],
+    te_bin["Gini"]
+  )
+)
+
+print(kable(cvte_bin,
+            col.names = c("Metric", "CV Mean (+/-SE)", "Test"),
+            align = c("l","c","c"),
+            row.names = FALSE))
+
+```
+
+\underline{Discussion:}
+
+The Pearson goodness-of-fit test confirms correct binomial calibration:
+
+- Pearson p = **0.312**, indicating no evidence of miscalibration under the binomial assumption.
+
+The dominant predictors align with structural severity drivers:
+
+- Strong negative effects for older vehicle age bands **(−0.895 for 8–12 years, −0.981 for 12+ years)** indicate that older vehicles are substantially less likely to generate extreme claims, consistent with lower replacement value. 
+- Value band and age category remain important contributors.
+- The growing_portfolio coefficient of **−1.386** indicates that clients in growing portfolios are considerably less likely to produce extreme claims. 
+
+The vehicle age direction is consistent with the severity models:
+- Older vehicles generate lower costs in both the traditional and binary classification settings.
+
+Test performance is consistent with cross-validation:
+
+- Test AUC = **0.6293** (= (1 + Gini) / 2), confirming that the classifier has modest but genuine discriminatory power: it ranks a randomly selected extreme claimant above a randomly selected attritional claimant approximately 63% of the time.
+- Test Gini = **0.236**, exceeding CV Gini = **0.191**; this improvement is attributed to **fold-composition differences**, not overfitting.
+- The Brier score shows **minimal train–test gap**, confirming stable probability calibration.
+
+
+## Severity Component for Attritional Claims - Gamma
+
+The Gamma GLM with a log link is fitted exclusively on attritional claimants (avg_claim_cost ≤ €900), representing approximately 91% of the claimant training population. By restricting the training sample to this homogeneous lower-cost segment, the Gamma model is freed from the distributional pull of extreme claims that degrades its fit in the traditional setting. The predictor matrix, encoding pipeline, and cross-validation structure are identical to those used for the traditional models; only the training subset changes. Metrics are reported on the attritional scale, so RMSE, MAE, and deviance values are expected to be substantially lower than their traditional counterparts by construction.
+
+```{r hurdle-gamma-att, echo=FALSE}
+
+cat("\n\n"); cat(strrep("=", 70))
+cat("\nHURDLE SEVERITY: GAMMA GLM — ATTRITIONAL CLAIMS (cost <= €900)\n"); cat(strrep("=", 70), "\n")
+
+# Fit
+gamma_att_fit  <- fit_glm(y_tr_att, X_tr_att, Gamma(link = "log"))
+cat("\n--- MODEL SUMMARY ---\n"); print(summary(gamma_att_fit))
+
+# Training metrics
+fv_gamma_att  <- fitted(gamma_att_fit)
+phi_gamma_att <- summary(gamma_att_fit)$dispersion
+k_gamma_att   <- length(coef(gamma_att_fit)) + 1   # +1 for dispersion parameter
+tr_gamma_att  <- sev_metrics(y_tr_att, fv_gamma_att,
+                              r2_cor(y_tr_att, fv_gamma_att),
+                              AIC(gamma_att_fit), BIC(gamma_att_fit))
+
+# Test metrics
+pred_gamma_att_te <- predict(gamma_att_fit, X_te_att, type = "response")
+ab_te_g_att       <- gamma_test_aic_bic(y_te_att, pred_gamma_att_te,
+                                         phi_gamma_att, k_gamma_att, n_te_att)
+te_gamma_att <- sev_metrics(y_te_att, pred_gamma_att_te,
+                             r2_cor(y_te_att, pred_gamma_att_te),
+                             ab_te_g_att["AIC"], ab_te_g_att["BIC"])
+
+# ── Consolidated training & test table ────────────────────────────────────────
+cat("\n--- TRAINING & TEST METRICS (Gamma — Attritional) ---\n")
+sev_rows <- c("R2 (Cor2)", "RMSE", "MAE", "Gamma_Dev", "LN_Dev [RSS_log]", "Gini")
+tbl_g_att <- data.frame(
+  Metric      = sev_rows,
+  Gamma_Train = unname(tr_gamma_att[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")]),
+  Gamma_Test  = unname(te_gamma_att[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")])
+)
+print(kable(tbl_g_att,
+            col.names = c("Metric", "Gamma_Att Train", "Gamma_Att Test"),
+            align = c("l","c","c"), row.names = FALSE))
+
+# ── CV vs Test comparison ──────────────────────────────────────────────────────
+cat("\n--- CV VS TEST COMPARISON (Gamma — Attritional) ---\n")
+cvte_g_att <- data.frame(
+  Metric     = c("R2 (Cor2)", "RMSE", "MAE", "Gamma Deviance", "Gini"),
+  CV_Mean_SE = c(
+    fmt_cv(cv_hurdle_s$mean["GAtt_R2"],   cv_hurdle_s$se["GAtt_R2"]),
+    fmt_cv(cv_hurdle_s$mean["GAtt_RMSE"], cv_hurdle_s$se["GAtt_RMSE"]),
+    fmt_cv(cv_hurdle_s$mean["GAtt_MAE"],  cv_hurdle_s$se["GAtt_MAE"]),
+    fmt_cv(cv_hurdle_s$mean["GAtt_Dev"],  cv_hurdle_s$se["GAtt_Dev"]),
+    fmt_cv(cv_hurdle_s$mean["GAtt_Gini"], cv_hurdle_s$se["GAtt_Gini"])),
+  Test = unname(te_gamma_att[c("R2","RMSE","MAE","Gamma_Dev","Gini")])
+)
+print(kable(cvte_g_att,
+            col.names = c("Metric", "CV Mean (+/-SE)", "Test"),
+            align = c("l","c","c"), row.names = FALSE))
+```
+
+\underline{Discussion:}
+
+The dispersion result confirms the original Gamma model was heavily misspecified:
+
+- The dispersion parameter φ collapses from **8.13 → 1.073** once extreme claims are removed.
+- This shows that the traditional model’s instability was driven almost entirely by **extreme‑claim contamination**, not by structural predictor failure.
+
+Key coefficient shifts highlight the impact of trimming:
+
+- Several sign reversals appear, including the **prior lapse** effect and the **reduced magnitude** of the vehicle age coefficients.
+- These reversals indicate that extreme claims were distorting the original parameter estimates.
+
+New predictors emerge once the tail is removed:
+
+- **Vehicle weight** becomes significant.
+- **Claim history frequency bands** also enter the model, suggesting more stable behavioural patterns once extreme claims are excluded.
+
+Cross‑validation confirms model stability:
+
+- CV standard error bands are **extremely narrow**, indicating consistent performance across folds and no evidence of fold‑level instability.
+
+## Severity Component for Attritional Claims - Log-Normal
+
+The Log-Normal model is fitted on the natural logarithm of attritional claim costs, exploiting the approximate log-normality of the lower-cost segment after removing the extreme tail. Predictions are returned to the original scale using the bias-corrected back-transformation exp(μ̂ + σ²/2), with σ estimated from the attritional training set. Because the extreme tail is excluded, σ is expected to be smaller than in the traditional Log-Normal model, yielding tighter confidence intervals and better-calibrated back-transformed predictions for the attritional range. The LN_Dev metric (residual sum of squares on the log scale) measures the quantity directly minimised by the OLS fit and provides an interpretable within-segment fit diagnostic.
+
+```{r hurdle-ln-att, echo=FALSE}
+
+cat("\n\n"); cat(strrep("=", 70))
+cat("\nHURDLE SEVERITY: LOG-NORMAL — ATTRITIONAL CLAIMS (cost <= €900)\n"); cat(strrep("=", 70), "\n")
+
+# Fit
+ln_att_fit   <- fit_lm(log(y_tr_att), X_tr_att)
+sigma_ln_att <- sigma(ln_att_fit)
+fv_ln_att_log <- fitted(ln_att_fit)
+fv_ln_att     <- ln_backtr(fv_ln_att_log, sigma_ln_att)
+p_ln_att      <- length(coef(ln_att_fit))
+cat("\n--- MODEL SUMMARY ---\n"); print(summary(ln_att_fit))
+
+# Training metrics
+ab_tr_ln_att  <- ln_aic_bic(y_tr_att, fv_ln_att_log, sigma_ln_att, p_ln_att, n_tr_att)
+tr_ln_att <- sev_metrics(y_tr_att, fv_ln_att,
+                          r2_cor(y_tr_att, fv_ln_att),
+                          ab_tr_ln_att["AIC"], ab_tr_ln_att["BIC"],
+                          pred_log = fv_ln_att_log)
+
+# Test metrics
+pred_ln_att_log_te <- predict(ln_att_fit, X_te_att)
+pred_ln_att_te     <- ln_backtr(pred_ln_att_log_te, sigma_ln_att)
+ab_te_ln_att <- { ll <- ll_lognormal(y_te_att, pred_ln_att_log_te, sigma_ln_att)
+                  c(AIC = -2*ll + 2*(p_ln_att+1), BIC = -2*ll + log(n_te_att)*(p_ln_att+1)) }
+te_ln_att <- sev_metrics(y_te_att, pred_ln_att_te,
+                          r2_cor(y_te_att, pred_ln_att_te),
+                          ab_te_ln_att["AIC"], ab_te_ln_att["BIC"],
+                          pred_log = pred_ln_att_log_te)
+
+# ── Consolidated training & test table ────────────────────────────────────────
+cat("\n--- TRAINING & TEST METRICS (Log-Normal — Attritional) ---\n")
+tbl_ln_att <- data.frame(
+  Metric    = sev_rows,
+  LN_Train  = unname(tr_ln_att[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")]),
+  LN_Test   = unname(te_ln_att[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")])
+)
+print(kable(tbl_ln_att,
+            col.names = c("Metric", "LN_Att Train", "LN_Att Test"),
+            align = c("l","c","c"), row.names = FALSE))
+
+# ── CV vs Test comparison ──────────────────────────────────────────────────────
+cat("\n--- CV VS TEST COMPARISON (Log-Normal — Attritional) ---\n")
+cvte_ln_att <- data.frame(
+  Metric     = c("R2 (Cor2)", "RMSE", "MAE", "LN Deviance [RSS_log]", "Gini"),
+  CV_Mean_SE = c(
+    fmt_cv(cv_hurdle_s$mean["LNAtt_R2"],   cv_hurdle_s$se["LNAtt_R2"]),
+    fmt_cv(cv_hurdle_s$mean["LNAtt_RMSE"], cv_hurdle_s$se["LNAtt_RMSE"]),
+    fmt_cv(cv_hurdle_s$mean["LNAtt_MAE"],  cv_hurdle_s$se["LNAtt_MAE"]),
+    fmt_cv(cv_hurdle_s$mean["LNAtt_Dev"],  cv_hurdle_s$se["LNAtt_Dev"]),
+    fmt_cv(cv_hurdle_s$mean["LNAtt_Gini"], cv_hurdle_s$se["LNAtt_Gini"])),
+  Test = unname(te_ln_att[c("R2","RMSE","MAE","LN_Dev","Gini")])
+)
+print(kable(cvte_ln_att,
+            col.names = c("Metric", "CV Mean (+/-SE)", "Test"),
+            align = c("l","c","c"), row.names = FALSE))
+```
+
+\underline{Discussion:}
+
+The Log-Normal attritional model is the best-specified model in the entire analysis:
+
+- **Pearson Chi-Squared = 13,780 on 13,780 df, p = 0.498**, indicating excellent distributional fit.
+- This confirms that, once extreme claims are removed, the log-normal assumption matches the data extremely well.
+
+Model parameters become more stable and interpretable:
+
+- The scale parameter σ reduces substantially, reflecting a tighter and more homogeneous log-cost distribution.
+- New predictors emerge as significant, including **multi-product holder** and **cross-sell ratio**, indicating clearer behavioural structure in the attritional segment.
+
+Several predictors drop out relative to the traditional model:
+
+- **Age category** and **risk score** no longer appear, suggesting their effects were driven primarily by extreme-claim behaviour rather than attritional severity.
+
+Ranking performance shows an interesting reversal:
+
+- Within the attritional segment, the Gamma model **slightly outperforms** the Log-Normal on Gini.
+- This is the opposite of the traditional (full-claim) comparison, where the Log-Normal dominated.
+- The reversal reflects the Gamma’s better alignment with ranking structure once extreme claims are removed.
+
+
+## Severity Component for Extreme Claims - Gamma 
+
+The Gamma GLM with a log link is fitted to extreme claims (avg_claim_cost > €900). While the Gamma is typically considered less heavy-tailed than the Pareto, fitting it specifically to the truncated extreme segment allows the dispersion parameter to adapt solely to the volatility of high-cost claims.
+
+```{r hurdle-gamma-ext, echo=FALSE}
+
+cat("\n\n"); cat(strrep("=", 70))
+cat("\nHURDLE SEVERITY: GAMMA GLM — EXTREME CLAIMS (cost > €900)\n"); cat(strrep("=", 70), "\n")
+
+# Fit
+gamma_ext_fit  <- fit_glm(y_tr_ext, X_tr_ext, Gamma(link = "log"))
+cat("\n--- MODEL SUMMARY ---\n"); print(summary(gamma_ext_fit))
+
+# Training metrics
+fv_gamma_ext  <- fitted(gamma_ext_fit)
+phi_gamma_ext <- summary(gamma_ext_fit)$dispersion
+k_gamma_ext   <- length(coef(gamma_ext_fit)) + 1
+tr_gamma_ext  <- sev_metrics(y_tr_ext, fv_gamma_ext,
+                             r2_cor(y_tr_ext, fv_gamma_ext),
+                             AIC(gamma_ext_fit), BIC(gamma_ext_fit))
+
+# Test metrics
+pred_gamma_ext_te <- predict(gamma_ext_fit, X_te_ext, type = "response")
+
+ab_te_g_ext <- gamma_test_aic_bic(
+    y = y_te_ext,
+    pred_mu = pred_gamma_ext_te,
+    phi = phi_gamma_ext,
+    k = k_gamma_ext,
+    n = n_te_ext
+)
+
+te_gamma_ext <- sev_metrics(
+    y_te_ext, 
+    pred_gamma_ext_te,
+    r2_cor(y_te_ext, pred_gamma_ext_te),
+    ab_te_g_ext["AIC"], 
+    ab_te_g_ext["BIC"]
+)
+
+# ── Consolidated training & test table ────────────────────────────────────────
+cat("\n--- TRAINING & TEST METRICS (Gamma — Extreme) ---\n")
+tbl_g_ext <- data.frame(
+  Metric      = sev_rows,
+  Gamma_Train = unname(tr_gamma_ext[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")]),
+  Gamma_Test  = unname(te_gamma_ext[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")])
+)
+print(kable(tbl_g_ext,
+            col.names = c("Metric", "Gamma_Ext Train", "Gamma_Ext Test"),
+            align = c("l","c","c"), row.names = FALSE))
+
+# ── CV vs Test comparison ──────────────────────────────────────────────────────
+cat("\n--- CV VS TEST COMPARISON (Gamma — Extreme) ---\n")
+cvte_g_ext <- data.frame(
+  Metric     = c("R2 (Cor2)", "RMSE", "MAE", "Gamma Deviance", "Gini"),
+  CV_Mean_SE = c(
+    fmt_cv(cv_hurdle_s$mean["GExt_R2"],   cv_hurdle_s$se["GExt_R2"]),
+    fmt_cv(cv_hurdle_s$mean["GExt_RMSE"], cv_hurdle_s$se["GExt_RMSE"]),
+    fmt_cv(cv_hurdle_s$mean["GExt_MAE"],  cv_hurdle_s$se["GExt_MAE"]),
+    fmt_cv(cv_hurdle_s$mean["GExt_Dev"],  cv_hurdle_s$se["GExt_Dev"]),
+    fmt_cv(cv_hurdle_s$mean["GExt_Gini"], cv_hurdle_s$se["GExt_Gini"])),
+  Test = unname(te_gamma_ext[c("R2","RMSE","MAE","Gamma_Dev","Gini")])
+)
+print(kable(cvte_g_ext,
+            col.names = c("Metric", "CV Mean (+/-SE)", "Test"),
+            align = c("l","c","c"), row.names = FALSE))
+```
+
+\underline{Discussion:}
+
+The Gamma extreme-segment model shows very limited explanatory power:
+
+  - Vehicle age reverses sign relative to the attritional model, with **older vehicles now associated with higher extreme costs**.
+  - The **value band loses all significance**, indicating that vehicle value does not meaningfully differentiate extreme claims.
+  - Most predictors become jointly insignificant, confirming that the model cannot extract stable structure from this segment.
+
+Model performance collapses due to insufficient data depth:
+
+  - Test R² falls by **91%**, demonstrating that the Gamma model cannot generalise within the extreme-claim subset.
+  - With only ~**1,326 extreme observations** for ~**49 parameters**, the model is severely underpowered.
+  - This lack of depth explains the instability, sign reversals, and disappearance of previously significant predictors.
+
+Overall, the Gamma model is not suitable for the extreme segment:
+
+  - The predictor set is too weak and the sample too small to support a reliable Gamma GLM.
+  - Extreme claims are driven by **claim-specific factors**, not portfolio-level predictors, making this modelling approach structurally inadequate for the segment.
+
+
+## Severity Component for Extreme Claims - Log-Normal 
+
+The Log-Normal model is fitted to extreme claims as an alternative to the Gamma for the upper segment. Because extreme claims span a wide absolute range but cluster more tightly after log transformation, the OLS fit on log-cost may capture within-segment structure more reliably than the Gamma's variance function. If the extreme tail follows a log-linear structure — driven by the same multiplicative risk factors as the attritional segment but at a higher intercept — the Log-Normal should generalise adequately within this subset. The LN_Dev metric (RSS on the log scale) is the quantity directly minimised by the OLS fit and serves as the primary within-model diagnostic; RMSE and Gini on the original cost scale allow direct cross-model comparison with the extreme Gamma.
+
+```{r hurdle-ln-ext, echo=FALSE}
+
+cat("\n\n"); cat(strrep("=", 70))
+cat("\nHURDLE SEVERITY: LOG-NORMAL — EXTREME CLAIMS (cost > €900)\n"); cat(strrep("=", 70), "\n")
+
+# Fit
+ln_ext_fit    <- fit_lm(log(y_tr_ext), X_tr_ext)
+sigma_ln_ext  <- sigma(ln_ext_fit)
+fv_ln_ext_log <- fitted(ln_ext_fit)
+fv_ln_ext     <- ln_backtr(fv_ln_ext_log, sigma_ln_ext)
+p_ln_ext      <- length(coef(ln_ext_fit))
+cat("\n--- MODEL SUMMARY ---\n"); print(summary(ln_ext_fit))
+
+# Training metrics
+ab_tr_ln_ext  <- ln_aic_bic(y_tr_ext, fv_ln_ext_log, sigma_ln_ext, p_ln_ext, n_tr_ext)
+tr_ln_ext <- sev_metrics(y_tr_ext, fv_ln_ext,
+                          r2_cor(y_tr_ext, fv_ln_ext),
+                          ab_tr_ln_ext["AIC"], ab_tr_ln_ext["BIC"],
+                          pred_log = fv_ln_ext_log)
+
+# Test metrics
+pred_ln_ext_log_te <- predict(ln_ext_fit, X_te_ext)
+pred_ln_ext_te     <- ln_backtr(pred_ln_ext_log_te, sigma_ln_ext)
+ab_te_ln_ext <- { ll <- ll_lognormal(y_te_ext, pred_ln_ext_log_te, sigma_ln_ext)
+                  c(AIC = -2*ll + 2*(p_ln_ext+1), BIC = -2*ll + log(n_te_ext)*(p_ln_ext+1)) }
+te_ln_ext <- sev_metrics(y_te_ext, pred_ln_ext_te,
+                          r2_cor(y_te_ext, pred_ln_ext_te),
+                          ab_te_ln_ext["AIC"], ab_te_ln_ext["BIC"],
+                          pred_log = pred_ln_ext_log_te)
+
+# ── Consolidated training & test table ────────────────────────────────────────
+cat("\n--- TRAINING & TEST METRICS (Log-Normal — Extreme) ---\n")
+tbl_ln_ext <- data.frame(
+  Metric    = sev_rows,
+  LN_Train  = unname(tr_ln_ext[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")]),
+  LN_Test   = unname(te_ln_ext[c("R2","RMSE","MAE","Gamma_Dev","LN_Dev","Gini")])
+)
+print(kable(tbl_ln_ext,
+            col.names = c("Metric", "LN_Ext Train", "LN_Ext Test"),
+            align = c("l","c","c"), row.names = FALSE))
+
+# ── CV vs Test comparison ──────────────────────────────────────────────────────
+cat("\n--- CV VS TEST COMPARISON (Log-Normal — Extreme) ---\n")
+cvte_ln_ext <- data.frame(
+  Metric     = c("R2 (Cor2)", "RMSE", "MAE", "LN Deviance [RSS_log]", "Gini"),
+  CV_Mean_SE = c(
+    fmt_cv(cv_hurdle_s$mean["LNExt_R2"],   cv_hurdle_s$se["LNExt_R2"]),
+    fmt_cv(cv_hurdle_s$mean["LNExt_RMSE"], cv_hurdle_s$se["LNExt_RMSE"]),
+    fmt_cv(cv_hurdle_s$mean["LNExt_MAE"],  cv_hurdle_s$se["LNExt_MAE"]),
+    fmt_cv(cv_hurdle_s$mean["LNExt_Dev"],  cv_hurdle_s$se["LNExt_Dev"]),
+    fmt_cv(cv_hurdle_s$mean["LNExt_Gini"], cv_hurdle_s$se["LNExt_Gini"])),
+  Test = unname(te_ln_ext[c("R2","RMSE","MAE","LN_Dev","Gini")])
+)
+print(kable(cvte_ln_ext,
+            col.names = c("Metric", "CV Mean (+/-SE)", "Test"),
+            align = c("l","c","c"), row.names = FALSE))
+```
+
+\underline{Discussion:}
+
+The Log-Normal extreme-segment model is correctly specified but structurally underpowered:
+
+- σ is **smaller than the attritional σ**, reflecting tighter clustering in log-space — extreme claims differ massively on the original scale but are much closer together after log transformation.
+- Adjusted R² is **near zero**, indicating that predictors explain almost none of the variation within the extreme-claim subset.
+- The joint-significance test also fails, confirming that the predictor set has **no meaningful explanatory power** for this segment.
+
+Only one predictor shows a stable, interpretable effect:
+
+- **Vehicle age** reverses direction relative to the attritional model and emerges as the only robust signal.
+- This suggests structural differences in the types of vehicles involved in extreme claims, rather than portfolio-level behavioural effects.
+
+The overall conclusion is that the model is well specified but fundamentally limited:
+
+- The Log-Normal passes distributional checks, meaning the **assumed error structure is appropriate**.
+- However, the predictor set is **too weak to explain variation** in extreme claims, which are driven by **claim-specific factors** (accident circumstances, liability, third-party involvement) rather than customer or vehicle attributes.
+- This is expected: extreme claims behave like a separate regime that portfolio-level GLM predictors cannot meaningfully capture.
+
+
+# Per-Component Diagnostics
+
+Before combining the five hurdle components into overall predictions, it is important to assess the distributional adequacy of each component individually on its training data. The binary classifier and the four severity sub-models (Gamma and Log-Normal fitted to attritional and extreme segments respectively) each carry distinct assumptions that deserve independent scrutiny. Failure at the component level propagates directly into the quality of the combined hurdle prediction, so this section provides the same battery of goodness-of-fit tests and diagnostic plots used for the traditional models, now applied separately to each of the five components. All evaluations are based on training residuals; the hold-out test set is reserved for the overall model comparisons in the following section.
+
+```{r hurdle-diag-setup, include=FALSE}
+# Binary logistic residuals
+dev_res_bin    <- residuals(bin_fit, type = "deviance")
+std_res_bin    <- (dev_res_bin - mean(dev_res_bin)) / sd(dev_res_bin)
+
+# Gamma — Attritional
+dev_res_gatt   <- residuals(gamma_att_fit, type = "deviance")
+std_res_gatt   <- (dev_res_gatt - mean(dev_res_gatt)) / sd(dev_res_gatt)
+
+# Log-Normal — Attritional
+res_ln_att_comp    <- residuals(ln_att_fit)
+std_res_ln_att     <- res_ln_att_comp / sigma_ln_att
+
+# Gamma — Extreme
+dev_res_gext   <- residuals(gamma_ext_fit, type = "deviance")
+std_res_gext   <- (dev_res_gext - mean(dev_res_gext)) / sd(dev_res_gext)
+
+# Log-Normal — Extreme
+res_ln_ext_comp     <- residuals(ln_ext_fit)
+std_res_ln_ext_comp <- res_ln_ext_comp / sigma_ln_ext
+```
+
+
+## Goodness-of-Fit Tests
+
+The same five-test battery applied to the traditional models is repeated here for each hurdle component. The Pearson Chi-Squared test checks whether the observed residual variance is consistent with the assumed distributional family — passing for the Log-Normal components (statistic ≈ degrees of freedom) and expected to fail for the Gamma components given the pattern already observed in the traditional setting. The Wald test assesses the joint significance of all predictors within each component. The Kolmogorov-Smirnov, Anderson-Darling, and Cramér-von Mises tests evaluate normality of the standardised residuals; at the sample sizes involved in each sub-sample these will be sensitive even to modest departures. For the binary logistic model, the Pearson statistic is computed from the Pearson residuals of the binomial GLM; for the severity components it follows the same convention as the traditional models.
+
+```{r hurdle-gof-tests, echo=FALSE}
+cat("\n--- GOF: Binary Logistic ---\n")
+gof_bin    <- run_gof_tests(bin_fit,       std_res_bin,        "logistic")
+print(gof_bin)
+
+cat("\n--- GOF: Gamma — Attritional ---\n")
+gof_gatt   <- run_gof_tests(gamma_att_fit, std_res_gatt,       "gamma")
+print(gof_gatt)
+
+cat("\n--- GOF: Log-Normal — Attritional ---\n")
+gof_ln_att <- run_gof_tests(ln_att_fit,    std_res_ln_att,     "lognormal")
+print(gof_ln_att)
+
+cat("\n--- GOF: Gamma — Extreme ---\n")
+gof_gext   <- run_gof_tests(gamma_ext_fit, std_res_gext,       "gamma")
+print(gof_gext)
+
+cat("\n--- GOF: Log-Normal — Extreme ---\n")
+gof_ln_ext <- run_gof_tests(ln_ext_fit,    std_res_ln_ext_comp,"lognormal")
+print(gof_ln_ext)
+```
+\underline{Discussion:}
+
+The five-component GOF battery reveals a clear two-tier structure across the hurdle model.
+
+Both Log-Normal components pass the Pearson Chi-Squared test:  
+  
+- **Attritional LN:** 13,780 on 13,780 df (p = 0.498)  
+- **Extreme LN:** 1,276 on 1,276 df (p = 0.495)  
+- These match their degrees of freedom almost exactly, confirming that the OLS normal-error assumption is correctly specified in both cost segments.
+
+Predictor significance differs sharply between the two LN components:
+
+- **Attritional LN:** Wald χ² = **523.0**, p = 0 — predictors jointly significant.  
+- **Extreme LN:** Wald p = **0.349** — predictors jointly insignificant, meaning the model is correctly specified but **statistically powerless** in the extreme segment.
+
+The binary logistic component is also well calibrated:
+
+- Pearson = **15,191** on 15,106 df (p = 0.312), confirming correct binomial specification.
+- KS, AD, and CvM statistics are extremely large (AD = **3,717**), but this is a **categorical artefact**: logistic deviance residuals are inherently bimodal, so normal-based residual tests are not meaningful and should be disregarded.
+
+Both Gamma components fail the Pearson test:
+
+- **Attritional Gamma:** 14,784 on 13,780 df (p = 0).  
+Failure reflects residual right-skew in the €0–€900 range that φ = 1.073 cannot fully absorb — the Gamma variance function remains slightly too narrow.
+- **Extreme Gamma:** 2,022 on 1,276 df (p = 0).  
+- Failure is compounded by **non-convergence**, so distributional calibration cannot be expected to hold.
+
+Residual normality tests reject for all continuous components:
+
+- KS, AD, and CvM reject at conventional levels for every model except the logistic (where they are inapplicable).
+- This is expected at large n: even small deviations from normality trigger rejection.
+
+The meaningful discriminator is the magnitude of the Anderson–Darling statistic:
+
+- **Gamma — attritional:** 227.7  
+- **LN — attritional:** 92.1  
+- **Gamma — extreme:** 42.0  
+- **LN — extreme:** 27.1  
+
+These values track both the improvement from Gamma → Log-Normal within each segment and the reduction in sample size between segments.
+
+
+## Deviance Residuals vs Fitted
+
+The residuals-versus-fitted plot for each component should show a point cloud distributed symmetrically around the zero line with a flat LOESS smoother. Any upward fan with increasing fitted values indicates that the assumed variance function is too narrow (common in misspecified Gamma models). Any systematic slope in the LOESS smoother suggests mean misspecification. The binary logistic residuals are plotted against the linear predictor (logit scale), which is the natural scale of the model. The Gamma severity components are plotted on the log scale of their fitted values (consistent with the log link), and the Log-Normal components are plotted against their log-scale fitted values (the space in which the model is linear).
+
+```{r hurdle-resid-fit, echo=FALSE, fig.width=14, fig.height=5, message=FALSE}
+library(patchwork)
+
+# Binary (logit scale on x-axis)
+lp_bin <- predict(bin_fit, type = "link")
+p_bin_rvf <- p_resid_v_fit(lp_bin, dev_res_bin, "Binary Logistic") +
+  labs(x = "Linear Predictor (logit)")
+print(p_bin_rvf + plot_annotation(title = "Residuals vs Fitted — Binary Logistic"))
+
+# Attritional pair
+p_gatt_rvf <- p_resid_v_fit(log(fv_gamma_att), dev_res_gatt,     "Gamma — Attritional")
+p_latt_rvf <- p_resid_v_fit(fv_ln_att_log,     res_ln_att_comp,  "LN — Attritional")
+print(p_gatt_rvf + p_latt_rvf +
+  plot_annotation(title    = "Residuals vs Fitted — Attritional Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+
+# Extreme pair
+p_gext_rvf <- p_resid_v_fit(log(fv_gamma_ext), dev_res_gext,     "Gamma — Extreme")
+p_lext_rvf <- p_resid_v_fit(fv_ln_ext_log,     res_ln_ext_comp,  "LN — Extreme")
+print(p_gext_rvf + p_lext_rvf +
+  plot_annotation(title    = "Residuals vs Fitted — Extreme Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+```
+
+\underline{Discussion:}
+
+The residuals-versus-fitted plots reveal clear differences in mean and variance specification across the five hurdle components:
+
+**Binary logistic:**  
+
+- The LOESS smoother declines sharply across the logit scale: large positive residuals at very negative logits (extreme cases assigned near‑zero probability) and negative residuals at high logits (cases assigned high extreme probability).  
+- This pattern is **structural under class imbalance**, not a sign of misspecification — the majority class dominates the low‑probability region, and minority‑class residuals pull the smoother upward at the left tail.
+
+**Attritional Gamma:**
+
+- The plot is far better behaved than in the traditional Gamma model.  
+- The LOESS smoother shows only mild upward drift across fitted values (log‑scale ~4.8–6.0), and residuals lie mostly within ±2 — a dramatic improvement over the 0–20 range previously observed.  
+- A narrow residual fan remains, reflecting near‑unit dispersion and improved calibration within the homogeneous cost band.
+
+**Attritional Log-Normal:**  
+
+- This is the cleanest severity diagnostic in the entire document.  
+- The LOESS smoother is almost perfectly flat across fitted values (log‑scale ~4.5–5.5), and residuals are symmetric with no visible heteroscedasticity.  
+- This matches the Pearson test and confirms that the Log‑Normal correctly models both the mean function and error structure for attritional claims.
+
+**Extreme Gamma:**  
+
+- Residuals cluster in the [0, 6] range with a strongly upward‑sloping LOESS.  
+- All deviance residuals are positive or near zero, indicating **systematic underestimation** of extreme costs at higher fitted values.  
+- Combined with non‑convergence, this makes the fitted‑value axis unreliable for interpreting misspecification — the Gamma cannot capture the heaviest tail even within the extreme segment.
+
+**Extreme Log-Normal:**  
+
+- Residuals are more symmetric, spanning roughly [−1, 4], with a relatively flat LOESS across fitted values (log‑scale ~7.2–8.0).  
+- A slight right‑tail lift appears at the highest fitted values, consistent with the small number of catastrophic claims (€20,000+) that neither model can predict from portfolio‑level predictors.  
+- Overall, the LN shows the most stable behaviour available for the extreme segment.
+
+
+## Residuals Histogram
+
+The residuals histogram overlays the empirical density of deviance (or OLS) residuals with a fitted normal curve. A close match between the histogram and the overlay indicates the assumed error structure is consistent with the data. For the Gamma severity components, substantial right skew in the histogram is a familiar sign of distributional misspecification in the extreme-cost direction. For the Log-Normal components, the histogram should be approximately bell-shaped if the log-normality assumption holds over the relevant sub-sample. The binary logistic histogram reflects the bimodal nature of deviance residuals from a binary outcome model and is naturally asymmetric; the normal overlay here serves primarily as a reference rather than an expected fit.
+
+```{r hurdle-hist-resid, echo=FALSE, fig.width=14, fig.height=5, message=FALSE}
+# ── Binary ───────────────────────────────────────────────────────────────────
+print(p_hist_resid(dev_res_bin, "Binary Logistic") +
+  plot_annotation(title = "Residuals Histogram — Binary Logistic"))
+
+# ── Attritional pair ─────────────────────────────────────────────────────────
+ph_gatt <- p_hist_resid(dev_res_gatt,    "Gamma — Attritional")
+ph_latt <- p_hist_resid(res_ln_att_comp, "LN — Attritional")
+print(ph_gatt + ph_latt +
+  plot_annotation(title    = "Residuals Histogram — Attritional Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+
+# ── Extreme pair ─────────────────────────────────────────────────────────────
+ph_gext <- p_hist_resid(dev_res_gext,    "Gamma — Extreme")
+ph_lext <- p_hist_resid(res_ln_ext_comp, "LN — Extreme")
+print(ph_gext + ph_lext +
+  plot_annotation(title    = "Residuals Histogram — Extreme Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+```
+
+\underline{Discussion:}
+
+The residual histograms with normal overlays summarise the within‑component distributional fit across the full training set.
+
+**Binary logistic:**  
+
+- The histogram is bimodal: a sharp spike near zero from correctly classified attritional cases and a right‑leaning tail from the minority extreme class.  
+- The normal overlay bears no resemblance to this shape — which is expected.  
+- Logistic deviance residuals are inherently non‑normal, so the overlay serves only as a visual reference rather than a diagnostic of misspecification.
+
+**Attritional Gamma:**  
+
+- The histogram is left‑peaked and right‑skewed, with a central mass near zero and a right tail that decays more slowly than Gaussian.  
+- Compared to the traditional Gamma (whose residuals extended beyond 20 SDs), this is a **major improvement** — the extreme‑claim contamination has been removed.  
+- The remaining right‑skew reflects the intrinsic asymmetry of claim costs even within the bounded attritional range.
+
+**Attritional Log-Normal:**  
+
+- The histogram is approximately bell‑shaped and aligns closely with the normal overlay across the central region (−2 to 2).  
+- A small excess appears in the left tail, but overall the fit is excellent.  
+- This visual corroborates the Pearson test and confirms the attritional LN as the **best‑fitting severity model** on distributional grounds.
+
+**Extreme Gamma:**  
+
+- The histogram is strongly right‑skewed, with mass between 0 and 2.5 and a long positive tail.  
+- The normal overlay underestimates the left‑side mass and cannot accommodate the right‑tail extension.  
+- Because the model did not converge, these residuals reflect an **unfinished optimisation surface**, not a stable distributional pattern.
+
+**Extreme Log-Normal:**  
+
+- The histogram is the most symmetric of the two extreme‑segment models.  
+- The normal overlay fits the central mass reasonably well, with some right‑tail excess consistent with Q‑Q evidence.  
+- The alignment is meaningfully better than the extreme Gamma, matching the Pearson test outcome (LN passes, Gamma fails).
+
+
+## Q-Q and P-P Plots
+
+The Q-Q plot maps empirical residual quantiles against theoretical normal quantiles: diagonal tracking indicates normality, while heavy upper-tail deviation flags right-skew in the residual distribution. The P-P plot maps the empirical cumulative distribution of standardised residuals against the theoretical normal CDF; an S-shaped deviation indicates the residuals are more peaked and heavy-tailed than the normal assumption allows. For each severity component, the Q-Q and P-P plots are shown as pairs (Gamma versus Log-Normal) to allow direct side-by-side comparison within each segment. The binary logistic Q-Q and P-P plots are shown together for that component.
+
+```{r hurdle-qqpp, echo=FALSE, fig.width=14, fig.height=5, message=FALSE}
+# ── Binary — QQ and PP together ───────────────────────────────────────────────
+print(p_qq(dev_res_bin, "Binary Logistic") + p_pp(std_res_bin, "Binary Logistic") +
+  plot_annotation(title = "Q-Q and P-P — Binary Logistic",
+                  subtitle = "Left: Q-Q | Right: P-P"))
+
+# ── Attritional — QQ pair ────────────────────────────────────────────────────
+print(p_qq(dev_res_gatt, "Gamma — Attritional") + p_qq(res_ln_att_comp, "LN — Attritional") +
+  plot_annotation(title    = "Q-Q Plots — Attritional Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+
+# ── Attritional — PP pair ────────────────────────────────────────────────────
+print(p_pp(std_res_gatt, "Gamma — Attritional") + p_pp(std_res_ln_att, "LN — Attritional") +
+  plot_annotation(title    = "P-P Plots — Attritional Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+
+# ── Extreme — QQ pair ────────────────────────────────────────────────────────
+print(p_qq(dev_res_gext, "Gamma — Extreme") + p_qq(res_ln_ext_comp, "LN — Extreme") +
+  plot_annotation(title    = "Q-Q Plots — Extreme Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+
+# ── Extreme — PP pair ────────────────────────────────────────────────────────
+print(p_pp(std_res_gext, "Gamma — Extreme") + p_pp(std_res_ln_ext_comp, "LN — Extreme") +
+  plot_annotation(title    = "P-P Plots — Extreme Components",
+                  subtitle = "Left: Gamma | Right: Log-Normal"))
+```
+
+
+# Overall Hurdle Comparisons and Evaluation
+
+This section brings together the four hurdle model combinations — **B-Gamma-Gamma (BG-G)**, **B-LN-LN (BLN-LN)**, **B-Gamma-LN (BG-LN)**, and **B-LN-Gamma (BLN-G)** — and compares them to the two traditional models (Gamma GLM and Log-Normal) on the full hold-out test set. Each hurdle model produces an expected claim cost for every test claimant as E[Y] = P̂(extreme) × Ê[Y|extreme] + (1 − P̂(extreme)) × Ê[Y|attritional], where P̂(extreme) comes from the binary logistic component and the segment-specific expected costs come from the corresponding severity sub-models, with Log-Normal predictions bias-corrected via the smearing back-transformation exp(μ̂ + σ²/2) throughout. The sub-models require predictions for all test claimants, not just those in their respective training segment; this is achieved by applying each component's fitted recipe to the full test set before predicting through the trained model.
+
+```{r hurdle-overall-setup, include=FALSE}
+# =============================================================================
+# HURDLE OVERALL: COMBINED PREDICTIONS AND VUONG LOG-LIKELIHOODS
+# =============================================================================
+
+# Encode all test claimants through each segment's trained recipe
+X_te_att_full <- bake(enc_att$recipe,
+  new_data = recode_ordinals(
+    test_sev[, get_predictor_cols(train_att, target), drop = FALSE]))
+
+X_te_ext_full <- bake(enc_ext$recipe,
+  new_data = recode_ordinals(
+    test_sev[, get_predictor_cols(train_ext, target), drop = FALSE]))
+
+# Severity sub-model predictions on all test claimants
+pred_gatt_all       <- predict(gamma_att_fit, X_te_att_full, type = "response")
+pred_gext_all       <- predict(gamma_ext_fit, X_te_ext_full, type = "response")
+
+pred_ln_att_log_all <- predict(ln_att_fit, X_te_att_full)
+pred_ln_att_all     <- ln_backtr(pred_ln_att_log_all, sigma_ln_att)
+
+pred_ln_ext_log_all <- predict(ln_ext_fit, X_te_ext_full)
+pred_ln_ext_all     <- ln_backtr(pred_ln_ext_log_all, sigma_ln_ext)
+
+# Hurdle combined expected costs: E[Y] = p_ext * E[Y|ext] + (1 - p_ext) * E[Y|att]
+pred_h_bgg   <- pred_bin_te * pred_gext_all   + (1 - pred_bin_te) * pred_gatt_all
+pred_h_blnln <- pred_bin_te * pred_ln_ext_all  + (1 - pred_bin_te) * pred_ln_att_all
+pred_h_bgln  <- pred_bin_te * pred_ln_ext_all  + (1 - pred_bin_te) * pred_gatt_all
+pred_h_blng  <- pred_bin_te * pred_gext_all   + (1 - pred_bin_te) * pred_ln_att_all
+
+# Pointwise log-likelihoods on the test set for the Vuong tests
+p_safe <- pmax(pmin(pred_bin_te, 1 - 1e-10), 1e-10)
+
+ll_trad_g_te <- dgamma(y_te_sev,
+  shape = 1 / phi_gamma,
+  scale = pred_gamma_te * phi_gamma,
+  log   = TRUE)
+
+ll_trad_ln_te <- dnorm(log(y_te_sev),
+  mean = pred_ln_log_te,
+  sd   = sigma_ln,
+  log  = TRUE) - log(y_te_sev)
+
+ll_h_bgg_te <- ifelse(ext_te,
+  log(p_safe) +
+    dgamma(y_te_sev, 1/phi_gamma_ext, scale = pred_gext_all * phi_gamma_ext, log = TRUE),
+  log(1 - p_safe) +
+    dgamma(y_te_sev, 1/phi_gamma_att, scale = pred_gatt_all * phi_gamma_att, log = TRUE))
+
+ll_h_blnln_te <- ifelse(ext_te,
+  log(p_safe) +
+    dnorm(log(y_te_sev), pred_ln_ext_log_all, sigma_ln_ext, log = TRUE) - log(y_te_sev),
+  log(1 - p_safe) +
+    dnorm(log(y_te_sev), pred_ln_att_log_all, sigma_ln_att, log = TRUE) - log(y_te_sev))
+
+ll_h_bgln_te <- ifelse(ext_te,
+  log(p_safe) +
+    dnorm(log(y_te_sev), pred_ln_ext_log_all, sigma_ln_ext, log = TRUE) - log(y_te_sev),
+  log(1 - p_safe) +
+    dgamma(y_te_sev, 1/phi_gamma_att, scale = pred_gatt_all * phi_gamma_att, log = TRUE))
+
+ll_h_blng_te <- ifelse(ext_te,
+  log(p_safe) +
+    dgamma(y_te_sev, 1/phi_gamma_ext, scale = pred_gext_all * phi_gamma_ext, log = TRUE),
+  log(1 - p_safe) +
+    dnorm(log(y_te_sev), pred_ln_att_log_all, sigma_ln_att, log = TRUE) - log(y_te_sev))
+
+# Training log-likelihoods and AIC/BIC for each hurdle combination
+# Components are fitted independently so their LLs are additive.
+# AIC/BIC are directly comparable across the four hurdle models but not to the
+# traditional model AIC/BIC.
+ll_bin_tr       <- -binom_dev(y_bin_tr, fv_bin) / 2
+ll_gatt_tr      <- ll_gamma(y_tr_att, fv_gamma_att, phi_gamma_att)
+ll_ln_att_tr    <- ll_lognormal(y_tr_att, fv_ln_att_log, sigma_ln_att)
+ll_gext_tr      <- ll_gamma(y_tr_ext, fv_gamma_ext, phi_gamma_ext)
+ll_ln_ext_tr    <- ll_lognormal(y_tr_ext, fv_ln_ext_log, sigma_ln_ext)
+
+# Parameter counts
+k_h_bin  <- k_bin                  # logistic: no separate dispersion term
+k_h_gatt <- k_gamma_att            # already includes +1 for Gamma dispersion
+k_h_latt <- p_ln_att + 1           # betas + sigma
+k_h_gext <- k_gamma_ext            # already includes +1 for Gamma dispersion
+k_h_lext <- p_ln_ext + 1           # betas + sigma
+
+k_h_bgg   <- k_h_bin + k_h_gatt + k_h_gext
+k_h_blnln <- k_h_bin + k_h_latt  + k_h_lext
+k_h_bgln  <- k_h_bin + k_h_gatt  + k_h_lext
+k_h_blng  <- k_h_bin + k_h_latt  + k_h_gext
+
+ll_h_bgg_tr   <- ll_bin_tr + ll_gatt_tr   + ll_gext_tr
+ll_h_blnln_tr <- ll_bin_tr + ll_ln_att_tr + ll_ln_ext_tr
+ll_h_bgln_tr  <- ll_bin_tr + ll_gatt_tr   + ll_ln_ext_tr
+ll_h_blng_tr  <- ll_bin_tr + ll_ln_att_tr + ll_gext_tr
+
+n_h <- n_tr_sev   # BIC penalty based on total training claimants
+
+aic_h_bgg   <- -2*ll_h_bgg_tr   + 2*k_h_bgg;   bic_h_bgg   <- -2*ll_h_bgg_tr   + log(n_h)*k_h_bgg
+aic_h_blnln <- -2*ll_h_blnln_tr + 2*k_h_blnln; bic_h_blnln <- -2*ll_h_blnln_tr + log(n_h)*k_h_blnln
+aic_h_bgln  <- -2*ll_h_bgln_tr  + 2*k_h_bgln;  bic_h_bgln  <- -2*ll_h_bgln_tr  + log(n_h)*k_h_bgln
+aic_h_blng  <- -2*ll_h_blng_tr  + 2*k_h_blng;  bic_h_blng  <- -2*ll_h_blng_tr  + log(n_h)*k_h_blng
+```
+
+
+\underline{Discussion:}
+
+The Q-Q and P-P plots reveal tail behaviour and global distributional shape beyond what the Pearson test and histograms capture.
+
+**Binary logistic:**  
+
+- The Q-Q plot shows an S‑shaped step pattern: sample quantiles cluster near 0 and −1 for the large attritional mass, then jump to 2–3 for the minority extreme class.  
+- The P-P plot mirrors this with a rapid empirical CDF rise followed by a long plateau — the signature of **two discrete mass concentrations**, not a continuous distribution.  
+- These patterns reflect the binary outcome structure and do **not** imply model failure.
+
+**Attritional Gamma vs LN (Q-Q):**  
+
+- The attritional Gamma Q-Q plot tracks the diagonal moderately well in the centre but shows lower‑tail depression (sample quantiles −4 to −5 vs theoretical −3) and mild upper‑tail elevation.  
+- This is far less severe than the traditional Gamma, whose upper tail reached 20 vs theoretical 4.  
+- The attritional LN Q-Q plot follows the diagonal closely across the central range (−2 to 2), with only mild S‑curve deviation at both extremes — consistent with a model that is correctly specified in the bulk but faces slight asymmetry at the boundaries.
+
+**Attritional Gamma vs LN (P-P):** 
+
+- Both models show S‑shaped deviation, indicating a distribution slightly more peaked and heavy‑tailed than normal.
+- The LN’s S‑curve is **shallower**, confirming the Pearson and histogram evidence that the LN provides a better‑calibrated probability structure across the attritional residual range.
+
+**Extreme Gamma vs LN (Q-Q):**  
+
+Both extreme‑segment Q-Q plots show pronounced upper‑tail inflation:  
+- Extreme Gamma: sample quantiles ~5 vs theoretical ~2  
+- Extreme LN: sample quantiles ~4 vs theoretical ~2  
+- These heavy upper tails reflect the small number of catastrophic claims that neither model can predict from portfolio‑level predictors.  
+- The LN’s inflation is **meaningfully smaller**, consistent with its lower Anderson–Darling statistic (27.1 vs 42.0).
+
+**Extreme Gamma vs LN (P-P):**  
+
+- Both extreme P-P plots show S‑shaped deviation, but the LN’s curve is **shallower**, especially in the upper tail, confirming its superior global calibration.  
+- Neither curve is as shallow as the attritional LN, underscoring that the extreme segment is inherently harder to model regardless of distributional family.
+
+
+## Vuong Tests
+
+The Vuong test is a non-nested likelihood-ratio test that determines whether model A or model B is significantly closer to the true data-generating process, without requiring either model to be correctly specified. The test statistic Z = √n · mean(mᵢ) / sd(mᵢ), where mᵢ = log f_A(yᵢ) − log f_B(yᵢ) is the observation-level log-likelihood difference, follows a standard normal distribution under the null hypothesis that both models are equally distant from the truth. Values of |Z| > 1.96 indicate a statistically significant preference at the 5% level. All eight pairwise comparisons (four hurdle models versus each of the two traditional models) are evaluated using the hold-out test set; the hurdle log-likelihoods embed the binary routing probability so that the full generative process of each hurdle model is accounted for in the comparison.
+
+```{r hurdle-vuong, echo=FALSE}
+vuong_test <- function(ll_A, ll_B, label_A, label_B) {
+  m_i  <- ll_A - ll_B
+  n    <- length(m_i)
+  Z    <- sqrt(n) * mean(m_i) / sd(m_i)
+  pval <- 2 * pnorm(-abs(Z))
+  data.frame(
+    Model_A  = label_A,
+    Model_B  = label_B,
+    Z_stat   = round(Z, 3),
+    P_value  = round(pval, 4),
+    Decision = ifelse(abs(Z) < 1.96,
+                 "Equivalent (p > 0.05)",
+                 ifelse(Z > 0,
+                   paste("Prefer", label_A),
+                   paste("Prefer", label_B)))
+  )
+}
+
+vuong_results <- rbind(
+  vuong_test(ll_h_bgg_te,   ll_trad_g_te,  "BG-G",   "Trad Gamma"),
+  vuong_test(ll_h_bgg_te,   ll_trad_ln_te, "BG-G",   "Trad LN"),
+  vuong_test(ll_h_blnln_te, ll_trad_g_te,  "BLN-LN", "Trad Gamma"),
+  vuong_test(ll_h_blnln_te, ll_trad_ln_te, "BLN-LN", "Trad LN"),
+  vuong_test(ll_h_bgln_te,  ll_trad_g_te,  "BG-LN",  "Trad Gamma"),
+  vuong_test(ll_h_bgln_te,  ll_trad_ln_te, "BG-LN",  "Trad LN"),
+  vuong_test(ll_h_blng_te,  ll_trad_g_te,  "BLN-G",  "Trad Gamma"),
+  vuong_test(ll_h_blng_te,  ll_trad_ln_te, "BLN-G",  "Trad LN")
+)
+
+print(kable(vuong_results,
+            col.names = c("Model A (Hurdle)", "Model B (Traditional)",
+                          "Z Statistic", "P-value", "Decision"),
+            align     = c("l","l","r","r","l"),
+            row.names = FALSE))
+cat("Note: Z > 1.96 → Model A preferred; Z < -1.96 → Model B preferred; |Z| < 1.96 → equivalent.\n")
+```
+
+\underline{Discussion:}
+
+The Vuong test delivers a clear and somewhat sobering conclusion:
+
+- All four hurdle model combinations **significantly outperform** the traditional Gamma GLM.
+- All four are **significantly dominated** by the traditional Log-Normal.
+- Every pairwise comparison yields a Z-statistic far beyond |1.96|, meaning the results are decisive rather than marginal.
+
+The ranking of hurdle combinations against the traditional Gamma is:
+
+- **BG–LN** (Z = 77.4)  
+- **BLN–LN** (Z = 72.5)  
+- **BG–G** (Z = 63.1)  
+- **BLN–G** (Z = 60.8)  
+
+This ordering shows a consistent pattern: hurdle models that include either the attritional LN or the LN extreme component outperform those relying on Gamma components. Even after trimming, the Gamma’s misspecification penalty remains detectable in the aggregate log-likelihood.
+
+The most important finding is the traditional Log-Normal’s dominance over all hurdle models:
+
+- Z-statistics range from **−16 to −26**, all strongly negative.
+- This does **not** imply that hurdle models are theoretically inferior; it reflects the specific data and implementation conditions.
+
+Three factors explain why the hurdle models underperform relative to the single Log-Normal:
+
+1. **The extreme-segment sub-model adds noise, not signal.**
+
+   - Cross-validated Gini is near zero.  
+   - Predictors are jointly insignificant.  
+   - A hurdle structure where one component is effectively a mean-only intercept model weighted by a small probability (~9%) cannot outperform a well-fitted single-distribution model whose log-normal assumption already fits the bulk of attritional claims well.
+
+2. **Routing probability is not strong enough to isolate true extreme claims.**  
+
+   - The logistic classifier achieves a test AUC of 0.618 (Gini = 0.236), but this is insufficient to concentrate the extreme model’s weight precisely on the true extreme observations.  
+   - Even occasional misrouting of attritional claims through the extreme component injects cost-scale noise into the combined prediction.
+
+3. **Vuong compares full generative likelihoods, penalising unnecessary parameters.**  
+
+   - The binomial routing layer consumes additional parameters without delivering commensurate likelihood gains under the prevailing extreme-segment data conditions.
+
+Overall, the Vuong results show that while hurdle models improve substantially over the traditional Gamma, they cannot surpass the traditional Log-Normal given the weak extreme-segment signal and the limited discriminatory power of the routing model.
+
+
+## Structural & Predictive Performance
+
+This table provides a unified comparison across all six models — two traditional and four hurdle — on the hold-out test set using scale-consistent metrics. R² (squared Pearson correlation, original cost scale), RMSE, MAE, and Gini are all computed on original-cost-scale predictions, with Log-Normal sub-model outputs bias-corrected via exp(μ̂ + σ²/2) before combination.
+
+```{r hurdle-perf-table, echo=FALSE}
+perf_tbl <- data.frame(
+  Model     = c("Trad Gamma", "Trad LN",
+                "BG-G", "BLN-LN", "BG-LN", "BLN-G"),
+  R2_Test   = round(c(
+    r2_cor(y_te_sev, pred_gamma_te),
+    r2_cor(y_te_sev, pred_ln_te),
+    r2_cor(y_te_sev, pred_h_bgg),
+    r2_cor(y_te_sev, pred_h_blnln),
+    r2_cor(y_te_sev, pred_h_bgln),
+    r2_cor(y_te_sev, pred_h_blng)), 4),
+  RMSE_Test = round(c(
+    rmse(y_te_sev, pred_gamma_te),
+    rmse(y_te_sev, pred_ln_te),
+    rmse(y_te_sev, pred_h_bgg),
+    rmse(y_te_sev, pred_h_blnln),
+    rmse(y_te_sev, pred_h_bgln),
+    rmse(y_te_sev, pred_h_blng)), 2),
+  MAE_Test  = round(c(
+    mae(y_te_sev, pred_gamma_te),
+    mae(y_te_sev, pred_ln_te),
+    mae(y_te_sev, pred_h_bgg),
+    mae(y_te_sev, pred_h_blnln),
+    mae(y_te_sev, pred_h_bgln),
+    mae(y_te_sev, pred_h_blng)), 2),
+  Gini_Test = round(c(
+    gini_index(y_te_sev, pred_gamma_te),
+    gini_index(y_te_sev, pred_ln_te),
+    gini_index(y_te_sev, pred_h_bgg),
+    gini_index(y_te_sev, pred_h_blnln),
+    gini_index(y_te_sev, pred_h_bgln),
+    gini_index(y_te_sev, pred_h_blng)), 4),
+  AIC_Train = round(c(
+    AIC(gamma_fit), ab_tr_ln[["AIC"]],
+    aic_h_bgg, aic_h_blnln, aic_h_bgln, aic_h_blng), 0),
+  BIC_Train = round(c(
+    BIC(gamma_fit), ab_tr_ln[["BIC"]],
+    bic_h_bgg, bic_h_blnln, bic_h_bgln, bic_h_blng), 0)
+)
+
+print(kable(perf_tbl[, c("Model","R2_Test","RMSE_Test","MAE_Test","Gini_Test")],
+            col.names = c("Model", "R\u00b2 (Test)", "RMSE (Test)",
+                          "MAE (Test)", "Gini (Test)"),
+            align     = c("l","c","c","c","c"),
+            row.names = FALSE))
+```
+
+\underline{Discussion:}
+
+The consolidated test-set performance table reinforces the Vuong test’s directional conclusions using scale‑interpretable metrics:
+
+**BLN–LN is the strongest hurdle combination** on every metric except RMSE:  
+
+- R² = **0.0104**, MAE = **461.9**, Gini = **0.1426**.  
+- It sits closest to the traditional LN across all measures and is the only hurdle model that approaches parity on Gini (0.1426 vs 0.1462 — a gap of just 0.0036).
+
+
+The attritional component drives almost all cross-model differences:
+
+- Hurdle models with the **attritional Log-Normal** achieve higher Gini than those with the attritional Gamma, confirming the LN’s superior ranking ability within the attritional segment.
+- Because attritional claims represent **91%** of all claimants, the attritional sub‑model overwhelmingly determines the combined **ranking** performance.
+- On **MAE**, the **extreme component** becomes the decisive factor:
+
+  - Extreme LN combinations: **BG–LN = 456.0**, **BLN–LN = 461.9**
+  - Extreme Gamma combinations: **BG–G = 469.5**, **BLN–G = 475.5**
+  - Since MAE emphasises median accuracy and the extreme model applies only to ~9% of claimants, the extreme LN’s tighter log‑scale fit yields lower expected‑cost errors.
+
+- The extreme Gamma’s unstable, non‑convergent coefficients inject noise into the combined prediction, raising MAE even when paired with the stronger attritional LN.
+- The extreme component’s **near‑zero Gini** means it contributes almost nothing to ranking quality; its influence enters primarily through the **binary routing probability**, not through its own severity predictions.
+
+
+All hurdle models improve over the traditional Gamma on Gini:
+
+- Hurdle Gini values range from **0.118–0.143**, compared with **0.105** for the traditional Gamma.  
+- This improvement arises from the logistic classifier (AUC = **0.618**, Gini = **0.236**), which reshapes the predicted cost ordering by routing most claimants toward the attritional component and assigning higher predicted costs to those flagged as potential extremes.
+
+RMSE remains uninformative across all models:
+
+- RMSE values lie in a narrow band (1,098.8–1,102.4), replicating the earlier finding that RMSE is dominated by a handful of catastrophic claims.  
+- Because no model predicts these outliers well, RMSE provides **no meaningful discrimination** in this dataset.
+
+
+
+## Actual vs Expected (AvE) Plots
+
+The AvE scatterplot for each model plots actual test claim costs against the model's predicted expected cost, with a 45° reference line marking perfect calibration and an orange LOESS smoother tracking the empirical mean actual cost at each level of predicted cost. A well-calibrated model should show its LOESS curve tracking the 45° diagonal. For the hurdle models, predicted costs are the probability-weighted combination of attritional and extreme sub-model outputs, and are expected to span a wider range than the traditional models due to the explicit separation of the two cost regimes. Systematic departure of the LOESS above the diagonal signals underprediction (the model is too conservative); departure below signals overprediction.
+
+```{r hurdle-ave-plots, echo=FALSE, fig.width=14, fig.height=10, message=FALSE}
+library(patchwork)
+
+ave1 <- p_ave(y_te_sev, pred_gamma_te,  "Trad Gamma")
+ave2 <- p_ave(y_te_sev, pred_ln_te,     "Trad LN")
+ave3 <- p_ave(y_te_sev, pred_h_bgg,     "Hurdle BG-G")
+ave4 <- p_ave(y_te_sev, pred_h_blnln,   "Hurdle BLN-LN")
+ave5 <- p_ave(y_te_sev, pred_h_bgln,    "Hurdle BG-LN")
+ave6 <- p_ave(y_te_sev, pred_h_blng,    "Hurdle BLN-G")
+
+(ave1 | ave2 | ave3) / (ave4 | ave5 | ave6) +
+  plot_annotation(
+    title    = "Actual vs Expected — All Models (Hold-out Test Set)",
+    subtitle = "Top row: Traditional models | Bottom row: Hurdle combinations",
+    theme    = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+```
+
+
+\underline{Discussion:}
+
+The AvE plots across all six models show that the hurdle framework does not materially expand the range of expected predictions relative to the traditional models, and the pattern of systematic underestimation in the upper tail persists throughout.
+
+For the traditional models:
+
+- The fitted-value ranges remain tightly compressed (Gamma: €200–€1,600; LN: €200–€900) because both models average over the full severity distribution.
+- In both cases, the LOESS smoother lies consistently above the 45° diagonal, indicating that actual costs frequently exceed model predictions across the entire fitted range.
+
+For the hurdle models:
+
+- Predicted ranges differ slightly by combination:  
+  **BG–G** and **BLN–G** (extreme Gamma) extend to ~€1,500 due to the extreme Gamma’s higher mean;  
+  **BG–LN** and **BLN–LN** (extreme LN) remain closer to €900–€1,200.
+- In all cases, the probability-weighted combination **narrows** the effective prediction range because the extreme component’s ~9% routing weight limits its influence on the final expected cost.
+- The LOESS smoother in every hurdle AvE plot remains above the diagonal, mirroring the traditional models.  
+  The hurdle structure redistributes predictions within a similar band but does **not** close the gap between model expectations and the actual right tail.
+
+The practical implication is that none of the models provide accurate individual-level predictions for the highest-cost observations in the test set. In this context, **decile-level AvE calibration** (as shown in the lift charts) is a more informative performance criterion than individual-level scatter.
+
+
+## Lift Charts
+
+The lift chart ranks all test claimants into ten deciles by predicted severity (lowest to highest) and plots the mean actual cost alongside the mean predicted cost for each decile. A model with strong discriminatory power produces a clearly monotonic actual-cost curve that rises steeply from left to right, and actual bars that track the predicted bars closely in each decile. Departures — particularly crossing of actual and predicted lines in middle deciles, or large divergence at the top decile — indicate poor calibration of the risk ranking. For the hurdle models, predictions are ordered by the combined expected cost, so the lift curve captures both the binary routing ability (separating attritional from extreme) and the segment-level ranking within each severity tier.
+
+```{r hurdle-lift-plots, echo=FALSE, fig.width=14, fig.height=10, message=FALSE}
+lft1 <- p_lift(y_te_sev, pred_gamma_te,  "Trad Gamma")
+lft2 <- p_lift(y_te_sev, pred_ln_te,     "Trad LN")
+lft3 <- p_lift(y_te_sev, pred_h_bgg,     "Hurdle BG-G")
+lft4 <- p_lift(y_te_sev, pred_h_blnln,   "Hurdle BLN-LN")
+lft5 <- p_lift(y_te_sev, pred_h_bgln,    "Hurdle BG-LN")
+lft6 <- p_lift(y_te_sev, pred_h_blng,    "Hurdle BLN-G")
+
+(lft1 | lft2 | lft3) / (lft4 | lft5 | lft6) +
+  plot_annotation(
+    title    = "Lift Charts — All Models (Hold-out Test Set)",
+    subtitle = "Top row: Traditional models | Bottom row: Hurdle combinations",
+    theme    = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+```
+
+
+\underline{Discussion:}
+
+The lift charts provide the most actionable comparison across all six models, showing how effectively each ranking concentrates high-cost claims in the top predicted deciles.
+
+**Traditional Log-Normal:** 
+
+- This is the smoothest and most consistently monotonic lift chart.  
+- The actual-cost curve rises steadily from ~€200 in decile 1 to ~€800 in decile 10.  
+- Predicted and actual bars track closely in the middle deciles (3–7), before the familiar top‑decile underprediction (predicted ≈ €600 vs actual ≈ €800).  
+- This underprediction is structural and common to all models — the top decile contains the most extreme claims, which cannot be anticipated from portfolio-level predictors.
+
+**Traditional Gamma:**  
+
+- The lift chart is more erratic, with actual and predicted bars crossing in deciles 3–5, reflecting its lower test Gini (0.105 vs 0.146 for the LN).  
+- The actual-cost curve is monotonic overall but exhibits local reversals, indicating weaker ranking performance in the mid-severity region.
+
+**BLN–LN (best hurdle model):**  
+
+- This produces the cleanest lift chart among the hurdle combinations, closely mirroring the traditional LN in shape and calibration.  
+- The actual-cost curve is smooth and monotonic, and the top-decile gap is similar in magnitude to the traditional LN.  
+    This confirms that BLN–LN’s ranking quality (Gini = 0.143) is substantively close to the traditional LN (0.146), even though the Vuong test identifies a significant log-likelihood difference.
+
+**BG–LN:** 
+
+- Produces a narrower prediction range, consistent with the attritional Gamma’s lower-scale fitted values.  
+- The monotonic profile is preserved, but top-decile calibration is weaker because the attritional Gamma compresses predictions toward lower costs.
+
+**BG–G and BLN–G (extreme Gamma combinations):**  
+
+- These show more erratic behaviour in the middle deciles.  
+- The extreme Gamma’s poorly estimated coefficients (non-convergent) inject noise into the combined expected cost, disrupting ranking in deciles 3–7.  
+- Top-decile performance is slightly better in absolute cost terms (actual ≈ €800), but intermediate-decile calibration deteriorates relative to LN-based combinations.
+
+Across all six lift charts, a shared structural limitation persists:
+
+- Every model underpredicts the top decile, assigning predicted means of €550–€650 against actual means of ~€800.  
+- This gap reflects the fundamental constraint identified throughout the analysis: the available predictor set lacks the claim-specific information needed to identify which high-predicted-severity claimants will generate catastrophic costs.  
+- The hurdle framework improves ranking in the middle deciles by separating attritional from extreme signal, but it cannot resolve the top-decile calibration gap because the extreme sub-model offers **no meaningful cross-validated discriminatory power** within the extreme segment.
+
+## Distributional Fit
+
+```{r, echo=FALSE}
+# =============================================================================
+# DISTRIBUTIONAL FIT VISUALISATION — SETUP
+# Pre-compute all quantities needed for overlays.
+# =============================================================================
+
+# Marginal Gamma parameters: E[Y] = mean(y), dispersion = phi
+# shape = 1/phi,  scale = mean(y) * phi  → mean = shape * scale = mean(y)
+
+# Traditional models
+gamma_marg_shape_trad <- 1 / phi_gamma
+gamma_marg_scale_trad <- mean(y_tr_sev) * phi_gamma
+ln_log_mean_trad      <- mean(log(y_tr_sev))
+# sigma_ln already in scope from the traditional LN model section
+
+# Attritional components
+gamma_marg_shape_att  <- 1 / phi_gamma_att
+gamma_marg_scale_att  <- mean(y_tr_att) * phi_gamma_att
+ln_log_mean_att       <- mean(log(y_tr_att))
+# sigma_ln_att already in scope
+
+# Extreme components  (phi_gamma_ext from non-convergent fit — use with caution)
+gamma_marg_shape_ext  <- 1 / phi_gamma_ext
+gamma_marg_scale_ext  <- mean(y_tr_ext) * phi_gamma_ext
+ln_log_mean_ext       <- mean(log(y_tr_ext))
+# sigma_ln_ext already in scope
+
+# Binary: fitted probabilities with actual class labels
+bin_fit_df <- data.frame(
+  prob  = fv_bin,
+  Class = ifelse(y_bin_tr == 1, "Extreme (y=1)", "Attritional (y=0)")
+)
+
+# Display cap: 99th percentile of each segment (avoids extreme-outlier distortion)
+cap_sev <- quantile(y_tr_sev, 0.99)
+cap_att <- quantile(y_tr_att, 0.995)   # tighter cap — segment is bounded at €900
+cap_ext <- quantile(y_tr_ext, 0.99)
+
+# Shared minimal theme for these plots
+th_dist <- theme_minimal(base_size = 10) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(size = 8, colour = "grey40"),
+    legend.position = "bottom"
+  )
+```
+
+```{r trad-dist, echo=FALSE, fig.width=13, fig.height=5}
+library(patchwork)
+
+# =============================================================================
+# ROW 1 — TRADITIONAL MODELS (full claimant training set)
+# =============================================================================
+
+p_tg <- ggplot(data.frame(y = y_tr_sev), aes(x = y)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 80,
+                 fill = "steelblue", alpha = 0.5, colour = "white") +
+  stat_function(fun   = dgamma,
+                args  = list(shape = gamma_marg_shape_trad,
+                             scale = gamma_marg_scale_trad),
+                colour = "red", linewidth = 0.9, n = 1000) +
+  coord_cartesian(xlim = c(0, cap_sev)) +
+  labs(title    = "Traditional Gamma GLM",
+       subtitle = sprintf(
+         "Gamma(shape = %.3f, scale = %.0f)  |  all claimants, original scale\n\u03c6\u0302 = %.3f  |  \u0233 = %.0f  |  n = %d",
+         gamma_marg_shape_trad, gamma_marg_scale_trad,
+         phi_gamma, mean(y_tr_sev), n_tr_sev),
+       x = "avg_claim_cost", y = "Density") + th_dist
+
+p_tl <- ggplot(data.frame(y = log(y_tr_sev)), aes(x = y)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 55,
+                 fill = "steelblue", alpha = 0.5, colour = "white") +
+  stat_function(fun   = dnorm,
+                args  = list(mean = ln_log_mean_trad, sd = sigma_ln),
+                colour = "red", linewidth = 0.9) +
+  labs(title    = "Traditional Log-Normal",
+       subtitle = sprintf(
+         "N(\u03bc = %.3f, \u03c3 = %.3f)  |  all claimants, log scale\n\u03bc\u0302 = mean(log y)  |  \u03c3\u0302 = %.3f  |  n = %d",
+         ln_log_mean_trad, sigma_ln, sigma_ln, n_tr_sev),
+       x = "log(avg_claim_cost)", y = "Density") + th_dist
+
+( p_tg | p_tl ) +
+  plot_annotation(
+    title    = "Traditional Models — Target Distributions (Training Data)",
+    subtitle = "Histogram = training observations  |  Red curve = marginal parametric assumption",
+    theme    = theme(plot.title    = element_text(size = 13, face = "bold"),
+                     plot.subtitle = element_text(size = 9,  colour = "grey40"))
+  )
+```
+
+**Traditional Gamma GLM.** The left panel plots the marginal Gamma assumption implied by the fitted model against the raw claim-cost distribution on the original euro scale. The estimated dispersion parameter $\hat\phi \approx 8.13$ translates into a shape parameter of $1/\hat\phi \approx 0.12$. Because the Gamma density is J-shaped whenever shape $< 1$ — placing infinite probability mass at zero and decaying monotonically — the red curve rises to the top of the plot at the left edge and drops almost immediately to zero, irrespective of the binwidth chosen. This behaviour is entirely a property of the global dispersion estimate, not of the log link. It is important to distinguish the two: the log link specifies how each observation's conditional mean $\mathbb{E}[Y \mid \mathbf{x}]$ is related to the linear predictor through $\log\mathbb{E}[Y \mid \mathbf{x}] = \mathbf{x}^{\top}\boldsymbol{\beta}$, ensuring fitted values are strictly positive and effects combine multiplicatively. It does not alter the shape of the error distribution. The marginal density displayed here averages over all predictor values, collapsing the model to a single Gamma with the overall mean (€475) and global dispersion, which is a far coarser summary than any individual's conditional distribution. The pronounced mismatch between the J-shaped red curve and the empirical histogram — which shows a finite mode around €200–€400 rather than a spike at zero — is a visual confirmation that the Gamma family, at this global dispersion, is not a faithful description of the unconditional distribution. The Pearson goodness-of-fit test formalises this: the statistic is far outside the expected chi-squared range, leading to rejection.
+
+**Traditional Log-Normal.** The right panel works on the log scale, where the model's distributional assumption reduces to $\log Y \sim \mathcal{N}(\mu, \sigma^2)$. Plotting the data after the logarithmic transformation produces the unimodal, near-symmetric histogram visible here. The fitted normal curve — centred at $\hat\mu = \overline{\log y} \approx 5.20$ with $\hat\sigma \approx 1.28$ — tracks the empirical shape closely across the entire range, including the right shoulder that corresponds to the most expensive claims. The Pearson chi-squared test does not reject this specification ($p \approx 0.50$), confirming that the log-normal error assumption is correctly calibrated for the full claimant population.
+
+```{r hurdle-row1, echo=FALSE, fig.width=16, fig.height=5}
+# =============================================================================
+# ROW 1 — BINARY COMPONENT + ATTRITIONAL PAIR
+# =============================================================================
+
+p_bin <- ggplot(bin_fit_df, aes(x = prob, fill = Class)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 alpha = 0.5, position = "identity", colour = "white") +
+  scale_fill_manual(values = c("Attritional (y=0)" = "steelblue",
+                               "Extreme (y=1)"     = "coral")) +
+  labs(title    = "Binary Logistic Component",
+       subtitle = sprintf(
+         "Density of fitted P(extreme) by actual class  |  Bernoulli assumption\nPearson p = 0.312 (correctly calibrated)  |  Test Gini = 0.236  |  n = %d",
+         n_tr_sev),
+       x = "Fitted P(extreme)", y = "Density", fill = "") + th_dist
+
+p_ga <- ggplot(data.frame(y = y_tr_att), aes(x = y)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60,
+                 fill = "steelblue", alpha = 0.5, colour = "white") +
+  stat_function(fun   = dgamma,
+                args  = list(shape = gamma_marg_shape_att,
+                             scale = gamma_marg_scale_att),
+                colour = "red", linewidth = 0.9, n = 1000) +
+  coord_cartesian(xlim = c(0, cap_att)) +
+  labs(title    = "Gamma — Attritional Component",
+       subtitle = sprintf(
+         "Gamma(shape = %.3f, scale = %.0f)  |  cost \u2264 \u00a3900, original scale\n\u03c6\u0302 = %.3f  |  \u0233 = %.0f  |  n = %d",
+         gamma_marg_shape_att, gamma_marg_scale_att,
+         phi_gamma_att, mean(y_tr_att), n_tr_att),
+       x = "avg_claim_cost (\u2264 \u00a3900)", y = "Density") + th_dist
+
+p_la <- ggplot(data.frame(y = log(y_tr_att)), aes(x = y)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 55,
+                 fill = "steelblue", alpha = 0.5, colour = "white") +
+  stat_function(fun   = dnorm,
+                args  = list(mean = ln_log_mean_att, sd = sigma_ln_att),
+                colour = "red", linewidth = 0.9) +
+  labs(title    = "Log-Normal — Attritional Component",
+       subtitle = sprintf(
+         "N(\u03bc = %.3f, \u03c3 = %.3f)  |  cost \u2264 \u00a3900, log scale\nPearson p = 0.498 (correctly specified)  |  n = %d",
+         ln_log_mean_att, sigma_ln_att, n_tr_att),
+       x = "log(avg_claim_cost) [\u2264 \u00a3900]", y = "Density") + th_dist
+
+( p_bin | p_ga | p_la ) +
+  plot_annotation(
+    title    = "Hurdle Components — Target Distributions (Training Data): Routing + Attritional",
+    subtitle = paste0(
+      "Histogram = training observations in the model\u2019s native space  |  ",
+      "Red curve = marginal parametric assumption\n",
+      "Gamma: shape = 1/\u03c6\u0302, scale = \u0233\u00b7\u03c6\u0302  |  ",
+      "Log-Normal: N(mean(log y), \u03c3\u0302)  |  ",
+      "Binary: density of fitted P(extreme) by class"),
+    theme = theme(plot.title    = element_text(size = 12, face = "bold"),
+                  plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+  )
+```
+
+**Binary Logistic Component.** This panel visualises how well the logistic routing model separates attritional claims (blue, $y = 0$) from extreme claims (coral, $y = 1$) based on the fitted probability $\hat{P}(\text{extreme} \mid \mathbf{x})$. Crucially, this is not a distributional fit to the claim-cost target; it is a fit to the binary segmentation decision. Each bar shows the density of predicted probabilities, separately for policies that turned out to be attritional (blue) and those that turned out to be extreme (coral). A perfectly discriminating model would show zero overlap between the two distributions — all attritional observations would cluster near $\hat{P} = 0$ and all extreme observations near $\hat{P} = 1$. In practice, the two histograms overlap substantially in the low-probability region (roughly 0–0.15), indicating that the available covariates cannot cleanly separate the two classes. The Pearson chi-squared test does not reject the Bernoulli assumption ($p = 0.312$), meaning the model is correctly calibrated in a probabilistic sense — the predicted probabilities are reliable as expected frequencies — but the Test AUC of 0.618 (Gini = 0.236) confirms only modest rank-ordering ability: the classifier ranks a randomly chosen extreme claimant above a randomly chosen attritional claimant approximately 62% of the time. This is a necessary but not sufficient condition for the hurdle framework to outperform the traditional single-distribution approach: a routing model that cannot reliably distinguish extreme from attritional claims will dilute rather than amplify predictive signal in the combined expected-cost prediction.
+
+**Gamma — Attritional Component.** Restricting the sample to claims at or below €900 narrows the distributional spread considerably relative to the full portfolio. The attritional dispersion estimate ($\hat\phi \approx 0.082$) corresponds to a Gamma shape of approximately 12, which produces the mound-shaped curve visible in red — substantially better-behaved than the J-shaped curve observed for the traditional Gamma on the full population. Despite this improvement, the histogram reveals a bimodal profile with secondary mass concentrated at low values, and the red curve's mode falls slightly to the right of the empirical peak, reflecting residual heterogeneity within the attritional segment that a single Gamma cannot fully absorb.
+
+**Log-Normal — Attritional Component.** On the log scale the attritional sub-sample is much closer to symmetric, and the fitted normal curve tracks the empirical distribution well. The Pearson chi-squared test confirms adequate specification ($p = 0.498$). The slight left shoulder in the histogram — corresponding to small claims near the lower boundary of the segment — is the main departure from perfect log-normality, but the overall fit is materially better than that of the Gamma on the original scale.
+
+```{r hurdle-row2, echo=FALSE, fig.width=13, fig.height=5}
+# =============================================================================
+# ROW 2 — EXTREME PAIR
+# =============================================================================
+
+p_ge <- ggplot(data.frame(y = y_tr_ext), aes(x = y)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 fill = "steelblue", alpha = 0.5, colour = "white") +
+  stat_function(fun   = dgamma,
+                args  = list(shape = gamma_marg_shape_ext,
+                             scale = gamma_marg_scale_ext),
+                colour = "red", linewidth = 0.9, n = 1000) +
+  coord_cartesian(xlim = c(900, cap_ext)) +
+  labs(title    = "Gamma — Extreme Component  \u26a0 Non-convergent",
+       subtitle = sprintf(
+         "Gamma(shape = %.3f, scale = %.0f)  |  cost > \u00a3900, original scale\n\u03c6\u0302 = %.3f (unreliable)  |  Pearson p \u2248 0  |  n = %d",
+         gamma_marg_shape_ext, gamma_marg_scale_ext,
+         phi_gamma_ext, n_tr_ext),
+       x = "avg_claim_cost (> \u00a3900)", y = "Density") + th_dist
+
+p_le <- ggplot(data.frame(y = log(y_tr_ext)), aes(x = y)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 fill = "steelblue", alpha = 0.5, colour = "white") +
+  stat_function(fun   = dnorm,
+                args  = list(mean = ln_log_mean_ext, sd = sigma_ln_ext),
+                colour = "red", linewidth = 0.9) +
+  labs(title    = "Log-Normal — Extreme Component",
+       subtitle = sprintf(
+         "N(\u03bc = %.3f, \u03c3 = %.3f)  |  cost > \u00a3900, log scale\nPearson p = 0.495 (correctly specified)  |  n = %d",
+         ln_log_mean_ext, sigma_ln_ext, n_tr_ext),
+       x = "log(avg_claim_cost) [> \u00a3900]", y = "Density") + th_dist
+
+( p_ge | p_le ) +
+  plot_annotation(
+    title    = "Hurdle Components — Target Distributions (Training Data): Extreme Segment",
+    subtitle = paste0(
+      "Histogram = training observations in the model\u2019s native space  |  ",
+      "Red curve = marginal parametric assumption\n",
+      "Gamma: shape = 1/\u03c6\u0302, scale = \u0233\u00b7\u03c6\u0302  |  ",
+      "Log-Normal: N(mean(log y), \u03c3\u0302)"),
+    theme = theme(plot.title    = element_text(size = 12, face = "bold"),
+                  plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+  )
+```
+
+**Gamma — Extreme Component (⚠ Non-convergent).** The extreme sub-sample ($n \approx 1{,}326$ claims above €900) exhibits strong right-skew with a very long upper tail extending beyond €15,000. The estimated dispersion is large ($\hat\phi \approx 1.585$), yielding a Gamma shape below 1 and thus a J-shaped density. The red curve again rises steeply toward the €900 boundary and decays rapidly, while the observed data shows substantially more mass distributed across the mid-range (€1,000–€5,000). The IWLS algorithm did not converge for this sub-model, meaning the reported dispersion estimate is numerically unreliable. The Pearson test rejects the Gamma specification ($p \approx 0$), confirming that the Gamma family cannot accommodate the heavy tail characteristic of the extreme segment.
+
+**Log-Normal — Extreme Component.** On the log scale the extreme sub-sample approximates a normal distribution reasonably well, with the fitted curve centred at $\hat\mu \approx 7.53$ ($e^{7.53} \approx \text{€}1{,}860$) and standard deviation $\hat\sigma \approx 0.675$. The Pearson test does not reject ($p = 0.495$). However, the practical value of this well-specified sub-model is undermined by the routing model's limited discriminatory power: even though the log-normal assumption is statistically adequate within the extreme segment, the model cannot reliably identify which claimants belong to this segment, which is what ultimately drives combined expected-cost predictions.
+
+
+---
+
+# Conclusion
+
+The accumulated evidence across all modelling stages supports a single, unambiguous recommendation: **the traditional Log-Normal GLM should be taken forward as the production severity model.**
+
+**Distributional adequacy:**  
+
+- The Log-Normal is the only model that passes the Pearson Chi-Squared GOF test on the full claimant population  
+  (15,106 on 15,106 df, p = 0.499).  
+- This confirms that the log-normal error assumption is correctly specified for the bulk of observed claim costs.  
+- The traditional Gamma fails this test severely, and although the attritional LN passes on its restricted subset, the hurdle framework must be judged on its **combined** generative distribution.
+
+**Out-of-sample predictive performance:**  
+
+- The traditional LN achieves the best hold-out metrics of all models:  
+  **Gini = 0.1462**, **MAE = 443.8**, **R² = 0.0118**.  
+- It outperforms the traditional Gamma on every metric and all four hurdle combinations on all but RMSE.  
+- RMSE is dominated by a handful of catastrophic claims and offers no meaningful discrimination in this dataset.
+
+**Formal model selection (Vuong test):**  
+
+- All four hurdle combinations are **significantly dominated** by the traditional LN  
+  (|Z| ≥ 16, p = 0 for all comparisons).  
+- This provides rigorous likelihood-based confirmation that the single-distribution LN is closer to the true  
+  data-generating process than any hurdle structure tested.
+
+**Parsimony:**  
+
+- The binary routing layer and segment-specific sub-models consume additional parameters without delivering  
+  commensurate log-likelihood gains, as confirmed by the Vuong test results.
+
+**Structural limitation of the hurdle framework:**  
+
+- The extreme-segment sub-model exhibits near-zero cross-validated Gini, jointly insignificant predictors  
+  (F-test p = 0.352 for the LN extreme component), and non-convergence under the Gamma family.  
+- This demonstrates that the available portfolio-level predictors lack the claim-specific information needed  
+  to differentiate costs within the extreme tail.  
+- A routing model with test AUC = 0.618 (Gini = 0.236) cannot concentrate extreme predictions precisely enough to overcome  
+  this limitation.
+
+**Overall conclusion:**  
+
+- The severity distribution of this portfolio is well characterised by a **single Log-Normal distribution**  
+  across all claimants.  
+- The added complexity of a two-stage hurdle decomposition, while theoretically motivated, is not justified  
+  by the data.  
+- Future modelling effort should focus on **enriching the feature set** — especially with claim-level or  
+  third-party information — before revisiting the hurdle architecture.
+
+
+

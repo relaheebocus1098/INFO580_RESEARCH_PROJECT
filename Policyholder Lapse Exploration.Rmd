@@ -1,0 +1,1059 @@
+---
+title: "Lapse Modelling"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+  word_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries Load
+
+```{r, include=FALSE}
+library(here)
+library(dplyr)
+library(rsample)
+library(recipes)
+library(MASS)
+library(survival)
+library(pROC)
+library(timeROC)
+library(knitr)
+library(ggplot2)
+```
+
+
+# Data Exploration
+
+This section sheds light on the three different segments that an insurance company would be interested in:
+
+1. Non-Renewal - lapse at end of period
+2. Cancellation: 
+  (a) before receipt of renewal letter (< 300 days)
+  (b) after receipt of renewal letter (>= 300 days)
+  
+We will look at how these three categories interact with the different predictors in our dataset.
+
+## Distribution Overview 
+
+We make use of a pie chart to represent the proportion of unlapse and the three lapse segments.
+
+```{r, echo=FALSE}
+basic_glm_data <- read.csv(
+  here("Feature_Selection_Four_Wheels_GLM_R.csv")
+)
+```
+
+
+## Exploring Relationship between Predictors and Targets
+
+### Correlation
+
+Spearman rank correlations between each predictor and the three lapse categories are computed separately. Using Spearman rather than Pearson correlation is deliberate: the target is heavily imbalanced and the predictors are a mix of ordinal bands and nominal categories encoded as integers, so a rank-based measure is more robust to the distributional shape of both variables.
+
+### Nominal Variables
+
+### Ordinal Variables
+
+### Binary Variables
+
+
+
+
+
+# Modelling Framework
+
+The lapse modelling framework follows the hurdle logic used for claims, decomposing lapse into two sequential decisions. **Stage 1** estimates P(lapse=1) on the full portfolio; **Stage 2** estimates P(early lapse | lapse=1) on policies that lapsed. A **Cox Proportional Hazards model** is fitted on all policies and evaluated at two landmarks: **300 days** (renewal letter) and **365 days** (expiry). This enables two formal comparisons: Stage 1 vs Cox's 1-S(T2) for *whether* a lapse occurs, and Stage 2 vs Cox's conditional ratio (1-S(T1))/(1-S(T2)) for *when* it occurs. All models are evaluated with the same metric suite (probabilistic accuracy, discrimination, classification, goodness-of-fit, calibration) and the same five client-stratified CV folds.
+
+
+## Data Pre-Processing
+
+Data is split 80:20 at the client level, stratified on a composite profile (ever_lapsed, ever_claimed, number of policies), so no client appears in both partitions. All three models share the same grouped 5-fold CV object (by client id); Stage 2 simply subsets each fold to lapsed policies without re-randomising. The encoding recipe is always fit on the training partition only, and days_to_event/lapse_flag are permanently excluded from all model matrices to prevent leakage.
+
+
+```{r, echo=FALSE}
+# 1. Client-stratified 80:20 train-test split (stratum: ever_lapsed, ever_claimed, n_policies)
+
+set.seed(42)
+
+client_strat <- basic_glm_data %>%
+  group_by(id) %>%
+  summarise(
+    ever_lapsed  = as.integer(any(lapse_flag == 1, na.rm = TRUE)),
+    ever_claimed = as.integer(any(n_claims_year > 0, na.rm = TRUE)),
+    n_policies   = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    policy_tier = case_when(
+      n_policies == 1 ~ "1", n_policies == 2 ~ "2", TRUE ~ "3+"
+    ),
+    strata = paste(ever_lapsed, ever_claimed, policy_tier, sep = "_")
+  )
+
+freq_tbl    <- table(client_strat$strata)
+rare_strata <- names(freq_tbl[freq_tbl == 1])
+client_strat <- client_strat %>%
+  mutate(strata = if_else(strata %in% rare_strata, "other", strata))
+
+split_obj <- initial_split(client_strat, prop = 0.8, strata = strata)
+train_ids  <- training(split_obj)$id
+test_ids   <- testing(split_obj)$id
+train_data <- basic_glm_data %>% filter(id %in% train_ids)
+test_data  <- basic_glm_data %>% filter(id %in% test_ids)
+
+cat(sprintf("Train: %d policies | %d clients\nTest : %d policies | %d clients\n",
+            nrow(train_data), n_distinct(train_data$id),
+            nrow(test_data),  n_distinct(test_data$id)))
+stopifnot(length(intersect(unique(train_data$id), unique(test_data$id))) == 0)
+cat("Client leakage check: PASSED\n")
+
+# 2. Grouped 5-fold CV by client id, shared across Stage 1, Cox, Stage 2.
+# Stage 2 just subsets each fold to lapsed policies; folds are not re-randomised.
+
+set.seed(42)
+cv_folds     <- group_vfold_cv(train_data, group = id, v = 5)
+leakage_free <- vapply(cv_folds$splits, function(sp) {
+  length(intersect(unique(analysis(sp)$id), unique(assessment(sp)$id))) == 0L
+}, logical(1))
+cat("Number of folds:", nrow(cv_folds), "\n")
+cat("Client-leakage-free across all folds:", all(leakage_free), "\n")
+
+# 3. Global encoding schema: recipe fit on train only, applied to test/validation.
+
+ ordinal_levels <- list(
+  age_category=c("18-25","26-35","36-45","46-55","56-65","65+"),
+  age_when_licensed_band=c("<=25",">25"),
+  driving_exp_category=c("<=5yrs","6-10yrs","11-20yrs","20+yrs"),
+  vehicle_age_category=c("0-3yrs","4-7yrs","8-12yrs","12+yrs"),
+  power_band=c("<100",">100"),
+  cylinder_band=c("0-1400","1400-1600","1600-2000","2000+"),
+  value_band=c("0-17500","17500-25000","25000-32500","32500+"),
+  weight_band=c("0-1100","1100-1500","1500+"),
+  length_imputed_band=c("<4","4-4.5",">4.5"),
+  n_doors_band=c("<=4",">4"),
+  claims_history_band=c("zero","one","two_to_three","four_to_five","six_plus"),
+  r_claims_history_band=c("0","0-0.35","0.35-0.7","0.7-1.5","1.5+"),
+  avg_claims_per_year_history_band=c("0","0-1",">1"),
+  cross_sell_ratio_band=c("<0.75",">=0.75"),
+  policy_retention_rate_band=c("<1","1"),
+  risk_score_band=c("0","0-0.01","0.01-0.15","0.15-0.2","0.2+"),
+  premium_band=c("0-250","250-300","300-350","350-400","400+"),
+  premium_vs_median_band=c("-15%","-15% to 0%","0% to 15%","15% to 30%","30%+")
+)
+
+recode_ordinals <- function(df) {
+  for (v in intersect(names(ordinal_levels), names(df)))
+    df[[v]] <- factor(df[[v]], levels = ordinal_levels[[v]], ordered = FALSE)
+  df
+}
+
+# Permanently excluded from all models (prevents days_to_event/lapse_flag leaking into Stage 2)
+always_exclude <- c("id","id2","n_claims_year","avg_claim_cost",
+                    "lapse_flag","days_to_event","exposure_years",
+                    "r_claims_history_band","claims_history_band")
+
+get_predictor_cols <- function(data, target)
+  setdiff(names(data), unique(c(always_exclude, target)))
+
+encode_predictors <- function(train_df, test_df, target) {
+  pred_cols <- get_predictor_cols(train_df, target)
+  x_tr <- recode_ordinals(train_df[, pred_cols, drop = FALSE])
+  x_te <- recode_ordinals(test_df[,  pred_cols, drop = FALSE])
+  rec  <- recipe(~ ., data = x_tr) %>%
+    step_novel(all_nominal_predictors()) %>%
+    step_unknown(all_nominal_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+    step_zv(all_predictors())
+  prp <- prep(rec, training = x_tr, retain = TRUE)
+  list(train = bake(prp, new_data = NULL),
+       test  = bake(prp, new_data = x_te),
+       recipe = prp)
+}
+
+strip_suffix <- function(dummy_names, known_vars = NULL) {
+  if (is.null(known_vars)) return(sub("_[^_]+$", "", dummy_names))
+  sapply(dummy_names, function(nm) {
+    cands <- known_vars[startsWith(nm, paste0(known_vars, "_"))]
+    if (length(cands) > 0) cands[which.max(nchar(cands))] else nm
+  }, USE.NAMES = FALSE)
+}
+
+# 4a. Shared metric helpers
+
+auc_score <- function(obs, pred) {
+  if (length(unique(obs)) < 2) return(NA_real_)
+  suppressMessages(as.numeric(pROC::auc(obs, pred)))
+}
+
+cindex_score <- function(time, event, lp)
+  survival::concordance(Surv(time, event) ~ I(-lp))$concordance
+
+# cv_summary: returns a 2-row matrix (Mean / SE) for every column.
+cv_summary <- function(tbl) {
+  means <- colMeans(tbl, na.rm = TRUE)
+  sds   <- apply(tbl, 2, sd, na.rm = TRUE)
+  n     <- colSums(!is.na(tbl))
+  rbind(Mean = means, SE = sds / sqrt(n))
+}
+
+# 4b. Binary model metric helpers (Scriney et al., 2020 suite), used for Stage 1, Stage 2, and Cox-derived probabilities
+
+LAPSE_THRESHOLD <- 0.5   # Classification threshold for all binary models.
+
+rmse_prob      <- function(obs, pred) sqrt(mean((obs-pred)^2, na.rm=TRUE))
+mae_prob       <- function(obs, pred) mean(abs(obs-pred), na.rm=TRUE)
+brier_score    <- function(obs, pred) mean((obs-pred)^2, na.rm=TRUE)
+binom_deviance <- function(obs, pred) {
+  pred <- pmax(pmin(pred, 1-1e-10), 1e-10)
+  -2 * sum(obs*log(pred) + (1-obs)*log(1-pred), na.rm=TRUE)
+}
+corr_r2   <- function(obs, pred) cor(obs, pred, use="complete.obs")^2
+gini_coef <- function(auc) 2*auc - 1
+
+confusion_metrics <- function(obs, pred, threshold = LAPSE_THRESHOLD) {
+  pc <- as.integer(pred >= threshold)
+  TP <- sum(pc==1 & obs==1, na.rm=TRUE); TN <- sum(pc==0 & obs==0, na.rm=TRUE)
+  FP <- sum(pc==1 & obs==0, na.rm=TRUE); FN <- sum(pc==0 & obs==1, na.rm=TRUE)
+  N  <- TP+TN+FP+FN
+  Pr <- if ((TP+FP)>0) TP/(TP+FP) else NA_real_
+  Re <- if ((TP+FN)>0) TP/(TP+FN) else NA_real_
+  Sp <- if ((TN+FP)>0) TN/(TN+FP) else NA_real_
+  F1 <- if (!is.na(Pr)&&!is.na(Re)&&(Pr+Re)>0) 2*Pr*Re/(Pr+Re) else NA_real_
+  data.frame(TP=TP,TN=TN,FP=FP,FN=FN,
+             Accuracy=(TP+TN)/N,Precision=Pr,Recall=Re,Specificity=Sp,F1=F1)
+}
+
+binary_lapse_metrics <- function(obs, pred) {
+  auc <- auc_score(obs, pred); cm <- confusion_metrics(obs, pred)
+  data.frame(R2=corr_r2(obs,pred), RMSE=rmse_prob(obs,pred),
+             MAE=mae_prob(obs,pred), Brier=brier_score(obs,pred),
+             Binom_Dev=binom_deviance(obs,pred),
+             AUC=auc, Gini=gini_coef(auc),
+             Accuracy=cm$Accuracy, Precision=cm$Precision,
+             Recall=cm$Recall, Specificity=cm$Specificity, F1=cm$F1)
+}
+
+hl_test_bin <- function(obs, pred, n_groups = 10) {
+  # Hosmer-Lemeshow calibration test for any binary outcome vs predicted prob.
+  breaks <- unique(quantile(pred, probs=seq(0,1,length.out=n_groups+1), na.rm=TRUE))
+  gv     <- cut(pred, breaks=breaks, include.lowest=TRUE, labels=FALSE)
+  HL <- 0; df <- 0
+  for (g in seq_len(max(gv, na.rm=TRUE))) {
+    idx <- which(gv == g)
+    if (length(idx) < 2) next
+    n_g <- length(idx); o_g <- sum(obs[idx]); e_g <- sum(pred[idx])
+    if (e_g <= 0 || e_g >= n_g) next
+    HL <- HL + (o_g-e_g)^2 / (e_g*(1-e_g/n_g)); df <- df+1
+  }
+  df_adj <- max(df-2, 1)
+  list(HL_stat=round(HL,3), df=df_adj,
+       p_value=round(pchisq(HL, df_adj, lower.tail=FALSE),4))
+}
+
+calibration_table_bin <- function(obs, pred, n_groups = 10) {
+  breaks <- unique(quantile(pred, probs=seq(0,1,length.out=n_groups+1), na.rm=TRUE))
+  gv     <- cut(pred, breaks=breaks, include.lowest=TRUE, labels=FALSE)
+  do.call(rbind, lapply(seq_len(max(gv,na.rm=TRUE)), function(g) {
+    idx <- which(gv == g)
+    data.frame(Decile=g, N=length(idx),
+               Mean_Pred=round(mean(pred[idx],na.rm=TRUE),4),
+               Obs_Rate =round(mean(obs[idx], na.rm=TRUE),4),
+               Calib_Err=round(mean(pred[idx],na.rm=TRUE)-mean(obs[idx],na.rm=TRUE),4))
+  }))
+}
+
+# 4c. Survival metric helpers; paired with binary_lapse_metrics() once Cox probabilities are extracted at T1/T2 (Section 9)
+
+LANDMARK_T1 <- 300L   # Renewal letter dispatch (~65 days before expiry)
+LANDMARK_T2 <- 365L   # Policy expiry / renewal date
+BRIER_GRID  <- c(seq(30L, 330L, by=30L), 365L)
+
+# S(t|xi) = exp(-H0(t) * exp(lp_centred_i)), via basehaz (mean-centred, no leakage)
+get_surv_from_cox <- function(cox_fit, lp_vec) {
+  bh <- basehaz(cox_fit, centered=TRUE)
+  H0 <- function(t) { idx <- which(bh$time<=t); if(!length(idx)) 0 else bh$hazard[max(idx)] }
+  data.frame(S_T1=exp(-H0(LANDMARK_T1)*exp(lp_vec)),
+             S_T2=exp(-H0(LANDMARK_T2)*exp(lp_vec)))
+}
+
+ipcw_brier_score <- function(train_time, train_event, val_time, val_event,
+                             surv_pred, t_star) {
+  km_cens <- survfit(Surv(train_time, 1L-train_event) ~ 1)
+  G_fn    <- stepfun(km_cens$time, c(1, km_cens$surv))
+  G_tstar <- G_fn(t_star)
+  if (is.na(G_tstar) || G_tstar <= 0) return(NA_real_)
+  n <- length(val_time); bsv <- rep(NA_real_, n)
+  early <- val_event==1L & val_time<=t_star
+  if (any(early)) {
+    idx <- which(early); G_ti <- G_fn(val_time[idx])
+    ok  <- !is.na(G_ti) & G_ti>0
+    bsv[idx[ok]] <- (0-surv_pred[idx[ok]])^2 / G_ti[ok]
+  }
+  past <- val_time > t_star
+  if (any(past)) bsv[which(past)] <- (1-surv_pred[which(past)])^2 / G_tstar
+  mean(bsv, na.rm=TRUE)
+}
+
+integrated_brier_score <- function(train_time, train_event, val_time, val_event,
+                                   cox_fit, lp_val, grid=BRIER_GRID) {
+  bh <- basehaz(cox_fit, centered=TRUE)
+  bs <- sapply(grid, function(t) {
+    idx <- which(bh$time<=t); H0 <- if(!length(idx)) 0 else bh$hazard[max(idx)]
+    ipcw_brier_score(train_time, train_event, val_time, val_event,
+                     exp(-H0*exp(lp_val)), t)
+  })
+  valid <- !is.na(bs)
+  if (sum(valid)<2) return(NA_real_)
+  g <- grid[valid]; bv <- bs[valid]
+  sum(diff(g)*(bv[-length(bv)]+bv[-1])/2) / (max(g)-min(g))
+}
+
+td_auc_at <- function(time_vec, event_vec, lp_vec, t_star) {
+  tryCatch({
+    res <- timeROC::timeROC(T=time_vec, delta=event_vec, marker=lp_vec,
+                            cause=1L, times=t_star, iid=FALSE)
+    av  <- as.numeric(res$AUC); av <- av[!is.na(av)&av>0]
+    if (!length(av)) NA_real_ else av[length(av)]
+  }, error=function(e) NA_real_)
+}
+
+obs_lapse_by_t <- function(time_vec, event_vec, t_star)
+  as.integer(event_vec==1L & time_vec<=t_star)
+
+calibration_table_surv <- function(obs_binary, pred_prob, n_groups=10) {
+  breaks <- unique(quantile(pred_prob, probs=seq(0,1,length.out=n_groups+1), na.rm=TRUE))
+  gv     <- cut(pred_prob, breaks=breaks, include.lowest=TRUE, labels=FALSE)
+  do.call(rbind, lapply(seq_len(max(gv,na.rm=TRUE)), function(g) {
+    idx <- which(gv==g)
+    data.frame(Decile=g, N=length(idx),
+               Mean_Pred=round(mean(pred_prob[idx],na.rm=TRUE),4),
+               Obs_Rate =round(mean(obs_binary[idx],na.rm=TRUE),4),
+               Calib_Err=round(mean(pred_prob[idx],na.rm=TRUE)-mean(obs_binary[idx],na.rm=TRUE),4))
+  }))
+}
+
+# 5. Export helper
+
+export_glm_summary <- function(fit, prefix) {
+  if (inherits(fit, "coxph")) {
+    cf <- as.data.frame(summary(fit)$coefficients)
+    cd <- data.frame(term=rownames(cf), estimate=cf[,"coef"],
+                     exp_coef=cf[,"exp(coef)"], se=cf[,"se(coef)"],
+                     z=cf[,"z"], p_value=cf[,"Pr(>|z|)"], stringsAsFactors=FALSE)
+  } else {
+    cf <- as.data.frame(summary(fit)$coefficients)
+    cd <- data.frame(term=rownames(cf), estimate=cf[,1], std_error=cf[,2],
+                     statistic=cf[,3], p_value=cf[,4], stringsAsFactors=FALSE)
+  }
+  write.csv(cd, here(paste0(prefix,"_coefficients.csv")), row.names=FALSE)
+  writeLines(capture.output(print(summary(fit))), here(paste0(prefix,"_summary.txt")))
+  cat(sprintf("Exported: %s_coefficients.csv | %s_summary.txt\n", prefix, prefix))
+}
+
+
+
+plot_calibration <- function(calib_tab, title = "Model Calibration Plot") {
+  ggplot(calib_tab, aes(x = Mean_Pred, y = Obs_Rate)) +
+    # 1. Reference line for perfect calibration (y = x)
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+    
+    # 2. Line connecting the deciles
+    geom_line(color = "#2b6cb0", linewidth = 1) +
+    
+    # 3. Points for each decile, sized by sample size (N)
+    geom_point(aes(size = N), color = "#c53030", alpha = 0.8) +
+    
+    # 4. Force axes to be strictly between 0 and 1 (probabilities)
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+    
+    # 5. Clean labeling and theme
+    labs(
+      title = title,
+      subtitle = "Dashed line indicates perfect calibration",
+      x = "Mean Predicted Probability",
+      y = "Observed Event Rate",
+      size = "Observations (N)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(color = "gray40", hjust = 0.5)
+    )
+}
+
+```
+
+## Binary Lapse Model Stage 1: lapse or not lapse?
+
+Stage 1 is a logistic GLM fitted on the full training portfolio, estimating P(lapse=1) from the profit-loaded risk premium and all inception-time covariates. Its output is the portfolio-wide whether-lapse probability, later compared against the Cox model's 1-S(T2=365) on the same population. Evaluation uses the full metric suite described above, reported as mean ± SE across the same five folds.
+
+
+```{r, echo=FALSE}
+cat("\n====================================================\n")
+cat("SECTION 6: STAGE 1 — Binary Lapse P(lapse = 1)\n")
+cat("====================================================\n")
+
+enc_lap       <- encode_predictors(train_data, test_data, "lapse_flag")
+train_mod_lap <- cbind(y=train_data$lapse_flag, enc_lap$train)
+test_mod_lap  <- cbind(y=test_data$lapse_flag,  enc_lap$test)
+lapse_model   <- glm(y ~ ., data=train_mod_lap, family=binomial())
+
+cat("\n--- 6a. MODEL SUMMARY ---\n")
+print(summary(lapse_model))
+
+# --- 6b. Train GLM Diagnostics ---
+# Null/Residual Deviance, AIC, Pearson GOF test for the Stage 1 GLM.
+cat("\n--- 6b. TRAIN GLM DIAGNOSTICS ---\n")
+cat("Null Deviance     :", round(lapse_model$null.deviance,2),
+    " on", lapse_model$df.null, "df\n")
+cat("Residual Deviance :", round(lapse_model$deviance,2),
+    " on", lapse_model$df.residual, "df\n")
+cat("AIC               :", round(AIC(lapse_model),2), "\n")
+s1_pX2 <- sum(residuals(lapse_model, type="pearson")^2)
+s1_pdf <- lapse_model$df.residual
+s1_pp  <- pchisq(s1_pX2, s1_pdf, lower.tail=FALSE)
+cat(sprintf("Pearson GOF       : X\u00b2=%.2f  df=%d  p=%.4f\n", s1_pX2, s1_pdf, s1_pp))
+
+# --- 6c. Train In-sample Metrics ---
+p_train_lap        <- predict(lapse_model, train_mod_lap, type="response")
+train_metrics_lap  <- binary_lapse_metrics(train_mod_lap$y, p_train_lap)
+cm_train_lap       <- confusion_metrics(train_mod_lap$y, p_train_lap)
+cat("\n--- 6c. TRAIN IN-SAMPLE METRICS (threshold =", LAPSE_THRESHOLD, ") ---\n")
+cat("  Probabilistic/Discrimination:\n")
+print(round(train_metrics_lap[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat("  Classification (Scriney et al., 2020):\n")
+cat(sprintf("    TP=%d  TN=%d  FP=%d  FN=%d\n",
+            cm_train_lap$TP,cm_train_lap$TN,cm_train_lap$FP,cm_train_lap$FN))
+print(round(train_metrics_lap[,c("Accuracy","Precision","Recall","Specificity","F1")],4))
+
+# --- 6d. Cross-Validation ---
+# Recipe re-fit per fold on analysis() only, to prevent validation-set leakage.
+cat("\n--- 6d. CV SCORES (TRAIN) — Mean \u00b1 SE across 5 folds ---\n")
+cv_results_lap <- lapply(cv_folds$splits, function(sp) {
+  tr <- analysis(sp); va <- assessment(sp)
+  enc <- encode_predictors(tr, va, "lapse_flag")
+  m   <- glm(tr$lapse_flag ~ ., data=cbind(enc$train), family=binomial())
+  p   <- predict(m, enc$test, type="response")
+  fm  <- binary_lapse_metrics(va$lapse_flag, p); fm$AIC <- AIC(m); fm
+})
+cv_tbl_lapse <- do.call(rbind, cv_results_lap)
+cv_sum_lapse <- cv_summary(cv_tbl_lapse)
+cat("  Probabilistic/Discrimination:\n")
+print(round(cv_sum_lapse[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini","AIC")],4))
+cat("  Classification (threshold =", LAPSE_THRESHOLD, "):\n")
+print(round(cv_sum_lapse[,c("Accuracy","Precision","Recall","Specificity","F1")],4))
+
+# --- 6e. Test Set ---
+p_test_lap        <- predict(lapse_model, test_mod_lap, type="response")
+test_metrics_lap  <- binary_lapse_metrics(test_mod_lap$y, p_test_lap)
+cm_test_lap       <- confusion_metrics(test_mod_lap$y, p_test_lap)
+hl_s1_test        <- hl_test_bin(test_mod_lap$y, p_test_lap)
+cat("\n--- 6e. TEST SCORES (threshold =", LAPSE_THRESHOLD, ") ---\n")
+print(round(test_metrics_lap[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat(sprintf("    TP=%d  TN=%d  FP=%d  FN=%d\n",
+            cm_test_lap$TP,cm_test_lap$TN,cm_test_lap$FP,cm_test_lap$FN))
+print(round(test_metrics_lap[,c("Accuracy","Precision","Recall","Specificity","F1")],4))
+cat(sprintf("  HL Calibration Test: HL=%.3f  df=%d  p=%.4f\n",
+            hl_s1_test$HL_stat, hl_s1_test$df, hl_s1_test$p_value))
+cat("\n--- 6f. Stage 1 Calibration Table (test set) ---\n")
+print(calibration_table_bin(test_mod_lap$y, p_test_lap))
+
+export_glm_summary(lapse_model, "baseline_lapse_flag")
+
+plot_calibration(calibration_table_bin(test_mod_lap$y, p_test_lap))
+
+```
+
+\underline{Discussion:}
+
+**Model Fit and Diagnostics**
+
+The deviance falls from 59,964.95 (null, 66,183 df) to 50,257.64 (66,126 df) after covariates -- a 16.2% reduction, with AIC = 50,373.64. The Pearson statistic of 67,886.13 gives a dispersion ratio of ~1.03, close to unity, so the binomial variance assumption holds reasonably well; the p-value of zero reflects sample size rather than misfit.
+
+**Covariate Significance**
+
+had_previous_lapse dominates (estimate 2.843, z = 74.7, p < 2x10^-16). premium_vs_median is monotone: each band above zero adds 0.11-0.41 to the log-odds. Higher vehicle value raises lapse risk (value_band_X32500. estimate 0.809), while heavier/lower-powered vehicles are protective (weight_band_X1500. -0.641; power_band_X.100 -0.236). Broker-placed policies (0.456) and single-named-driver policies (0.288) lapse more; multi-policy holders (-0.606) and long-tenured customers (-0.731) lapse less. Spring and Winter starts carry modestly elevated log-odds (0.196, 0.211).
+
+**Probabilistic Accuracy and Discrimination**
+
+Training AUC is 0.7461, falling to 0.7369 on test; the CV mean of 0.7437 ± 0.0032 confirms stable generalisation. Gini of 0.4738 reflects moderate but genuine discrimination, as expected for an unregularised full-predictor baseline. Brier Score is 0.115 on test (CV mean 0.1142 ± 0.0006), and R² is 0.182.
+
+**Classification Performance**
+
+At the 0.5 threshold, class imbalance (lapsers ~16.8% of training) shows clearly: the model correctly identifies 758 of 2,802 test lapsers (recall 0.2705, F1 0.3894), with high specificity (0.9758) and precision 0.6948. CV mean accuracy (0.8567 ± 0.0006) and recall (0.2684 ± 0.0063) closely match the test values. Low recall at this threshold is expected for a baseline on imbalanced data.
+
+**Calibration**
+
+HL = 35.132 (df=8, p=0.0000) formally rejects calibration, but the decile table shows modest practical miscalibration: error ranges from -0.017 (lowest decile) to 0.021 (decile 5), shrinking to ±0.013 in the upper half and near-zero (-0.002) at the highest-risk decile. The rejection is likely driven by sample size rather than material miscalibration.
+
+## Survival Lapse Model: Cox Proportional Hazards 
+
+The Cox model is fitted on the full training portfolio with days_to_event as the time axis and lapse_flag as the event indicator; non-lapsed policies are right-censored. Unlike Stage 2, it addresses both whether and when in one model: 1-S(T2=365) gives the lapse-by-expiry probability, and (1-S(T1))/(1-S(T2)) gives the conditional early-lapse probability. Model adequacy is checked via the Grambsch-Therneau PH test, global LR/Wald/score tests, IPCW Brier Scores at T1/T2, the Integrated Brier Score, time-dependent AUC, and Hosmer-Lemeshow calibration at T2. Each CV fold also computes the corresponding binary-style metrics so the Cox outputs can be compared directly against Stage 1 and Stage 2.
+
+
+
+```{r, echo=FALSE}
+cat("\n====================================================\n")
+cat("SECTION 7: COX PH SURVIVAL MODEL\n")
+cat(sprintf("Landmarks: T1=%d (letter), T2=%d (expiry)\n", LANDMARK_T1, LANDMARK_T2))
+cat("====================================================\n")
+
+enc_srv       <- encode_predictors(train_data, test_data, "days_to_event")
+train_mod_srv <- cbind(time=train_data$days_to_event, event=train_data$lapse_flag, enc_srv$train)
+test_mod_srv  <- cbind(time=test_data$days_to_event,  event=test_data$lapse_flag,  enc_srv$test)
+surv_model    <- coxph(Surv(time, event) ~ ., data=train_mod_srv)
+
+cat("\n--- 7a. MODEL SUMMARY ---\n")
+print(summary(surv_model)); surv_smry <- summary(surv_model)
+
+# --- 7b. Train GOF Tests ---
+cat("\n--- 7b. TRAIN GOF TESTS ---\n")
+cat("\n  [1] Grambsch-Therneau PH Test (tests H0: hazard ratios are constant over time):\n")
+ph_test <- cox.zph(surv_model); print(ph_test)
+cat(sprintf("  Global p = %.4f\n", ph_test$table["GLOBAL","p"]))
+cat(sprintf("\n  [2] LRT : X\u00b2=%.2f  df=%d  p=%.4f\n",
+            surv_smry$logtest["test"],  surv_smry$logtest["df"],  surv_smry$logtest["pvalue"]))
+cat(sprintf("  [3] Wald: X\u00b2=%.2f  df=%d  p=%.4f\n",
+            surv_smry$waldtest["test"], surv_smry$waldtest["df"], surv_smry$waldtest["pvalue"]))
+cat(sprintf("  [4] Score: X\u00b2=%.2f  df=%d  p=%.4f\n",
+            surv_smry$sctest["test"],   surv_smry$sctest["df"],   surv_smry$sctest["pvalue"]))
+
+# --- 7c. Train In-sample Metrics ---
+cat("\n--- 7c. TRAIN IN-SAMPLE METRICS ---\n")
+lp_tr    <- predict(surv_model, train_mod_srv, type="lp")
+sp_train <- get_surv_from_cox(surv_model, lp_tr)
+
+ci_train    <- cindex_score(train_mod_srv$time, train_mod_srv$event, lp_tr)
+tauc_T1_tr  <- td_auc_at(train_mod_srv$time, train_mod_srv$event, lp_tr, LANDMARK_T1)
+tauc_T2_tr  <- td_auc_at(train_mod_srv$time, train_mod_srv$event, lp_tr, LANDMARK_T2)
+bs_T1_tr    <- ipcw_brier_score(train_mod_srv$time,train_mod_srv$event,
+                                train_mod_srv$time,train_mod_srv$event, sp_train$S_T1, LANDMARK_T1)
+bs_T2_tr    <- ipcw_brier_score(train_mod_srv$time,train_mod_srv$event,
+                                train_mod_srv$time,train_mod_srv$event, sp_train$S_T2, LANDMARK_T2)
+ibs_tr      <- integrated_brier_score(train_mod_srv$time,train_mod_srv$event,
+                                      train_mod_srv$time,train_mod_srv$event, surv_model, lp_tr)
+bm_W_train  <- binary_lapse_metrics(train_data$lapse_flag, 1-sp_train$S_T2)
+
+# Cox WHEN on lapsed training subset: P(early|lapse) = (1-S(T1))/(1-S(T2)), clipped to [0,1]
+lapsed_tr_idx    <- which(train_mod_srv$event==1L)
+cox_when_tr_p    <- pmin((1-sp_train$S_T1[lapsed_tr_idx]) /
+                           pmax(1-sp_train$S_T2[lapsed_tr_idx], 1e-10), 1)
+early_obs_tr     <- as.integer(train_mod_srv$time[lapsed_tr_idx] <= LANDMARK_T1)
+bm_WN_train      <- binary_lapse_metrics(early_obs_tr, cox_when_tr_p)
+
+cat(sprintf("  C-Index=%.4f | td-AUC(T1)=%.4f | td-AUC(T2)=%.4f\n",
+            ci_train, tauc_T1_tr, tauc_T2_tr))
+cat(sprintf("  Brier(T1)=%.4f | Brier(T2)=%.4f | IBS=%.4f | AIC=%.0f\n",
+            bs_T1_tr, bs_T2_tr, ibs_tr, AIC(surv_model)))
+cat("\n  WHETHER (1-S(T2) vs lapse_flag, full training set):\n")
+print(round(bm_W_train[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat(sprintf("  WHEN (conditional prob on %d lapsed training obs):\n", length(lapsed_tr_idx)))
+print(round(bm_WN_train[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+
+# --- 7d. Cross-Validation ---
+cat("\n--- 7d. CV SCORES (TRAIN) — Mean \u00b1 SE across 5 folds ---\n")
+cv_results_srv <- lapply(cv_folds$splits, function(sp) {
+  tr <- analysis(sp); va <- assessment(sp)
+  enc    <- encode_predictors(tr, va, "days_to_event")
+  tr_mod <- cbind(time=tr$days_to_event, event=tr$lapse_flag, enc$train)
+  va_mod <- cbind(time=va$days_to_event, event=va$lapse_flag, enc$test)
+  m      <- coxph(Surv(time,event) ~ ., data=tr_mod)
+  lp     <- predict(m, va_mod, type="lp")
+  sp_va  <- get_surv_from_cox(m, lp)
+  bm_W   <- binary_lapse_metrics(va$lapse_flag, 1-sp_va$S_T2)
+  
+  # Cox WHEN on the fold's lapsed subset; tryCatch guards against too few obs or no variation in early_lapse
+  bm_WN <- tryCatch({
+    lv <- which(va_mod$event==1L)
+    if (length(lv)<2) stop("too few lapsed")
+    ev <- as.integer(va_mod$time[lv]<=LANDMARK_T1)
+    if (length(unique(ev))<2) stop("no variation in early_lapse in this fold")
+    cp <- pmin((1-sp_va$S_T1[lv])/pmax(1-sp_va$S_T2[lv],1e-10), 1)
+    binary_lapse_metrics(ev, cp)
+  }, error=function(e)
+    data.frame(R2=NA_real_,RMSE=NA_real_,MAE=NA_real_,Brier=NA_real_,
+               Binom_Dev=NA_real_,AUC=NA_real_,Gini=NA_real_,
+               Accuracy=NA_real_,Precision=NA_real_,Recall=NA_real_,
+               Specificity=NA_real_,F1=NA_real_))
+  
+  data.frame(
+    C_Index=cindex_score(va_mod$time,va_mod$event,lp),
+    tdAUC_T1=td_auc_at(va_mod$time,va_mod$event,lp,LANDMARK_T1),
+    tdAUC_T2=td_auc_at(va_mod$time,va_mod$event,lp,LANDMARK_T2),
+    Brier_T1=ipcw_brier_score(tr_mod$time,tr_mod$event,va_mod$time,va_mod$event,sp_va$S_T1,LANDMARK_T1),
+    Brier_T2=ipcw_brier_score(tr_mod$time,tr_mod$event,va_mod$time,va_mod$event,sp_va$S_T2,LANDMARK_T2),
+    IBS=integrated_brier_score(tr_mod$time,tr_mod$event,va_mod$time,va_mod$event,m,lp),
+    AIC=AIC(m),
+    W_R2=bm_W$R2,W_RMSE=bm_W$RMSE,W_MAE=bm_W$MAE,W_Brier=bm_W$Brier,
+    W_BD=bm_W$Binom_Dev,W_AUC=bm_W$AUC,W_Gini=bm_W$Gini,
+    W_Acc=bm_W$Accuracy,W_Prec=bm_W$Precision,W_Rec=bm_W$Recall,
+    W_Spec=bm_W$Specificity,W_F1=bm_W$F1,
+    WN_R2=bm_WN$R2,WN_RMSE=bm_WN$RMSE,WN_MAE=bm_WN$MAE,WN_Brier=bm_WN$Brier,
+    WN_BD=bm_WN$Binom_Dev,WN_AUC=bm_WN$AUC,WN_Gini=bm_WN$Gini,
+    WN_Acc=bm_WN$Accuracy,WN_Prec=bm_WN$Precision,WN_Rec=bm_WN$Recall,
+    WN_Spec=bm_WN$Specificity,WN_F1=bm_WN$F1
+  )
+})
+cv_tbl_surv <- do.call(rbind, cv_results_srv)
+cv_sum_surv <- cv_summary(cv_tbl_surv)
+cat("  Survival-specific:\n")
+print(round(cv_sum_surv[,c("C_Index","tdAUC_T1","tdAUC_T2","Brier_T1","Brier_T2","IBS","AIC")],4))
+cat("  WHETHER — binary metrics at T2 (CV):\n")
+print(round(cv_sum_surv[,c("W_R2","W_RMSE","W_MAE","W_Brier","W_BD","W_AUC","W_Gini")],4))
+print(round(cv_sum_surv[,c("W_Acc","W_Prec","W_Rec","W_Spec","W_F1")],4))
+cat("  WHEN — conditional prob on lapsed subset (CV):\n")
+print(round(cv_sum_surv[,c("WN_R2","WN_RMSE","WN_MAE","WN_Brier","WN_BD","WN_AUC","WN_Gini")],4))
+print(round(cv_sum_surv[,c("WN_Acc","WN_Prec","WN_Rec","WN_Spec","WN_F1")],4))
+
+# --- 7e. Test Set ---
+cat("\n--- 7e. TEST SCORES ---\n")
+lp_te    <- predict(surv_model, test_mod_srv, type="lp")
+sp_test  <- get_surv_from_cox(surv_model, lp_te)
+S_T1_te  <- sp_test$S_T1; S_T2_te <- sp_test$S_T2
+
+ci_te       <- cindex_score(test_mod_srv$time, test_mod_srv$event, lp_te)
+tauc_T1_te  <- td_auc_at(test_mod_srv$time,test_mod_srv$event,lp_te,LANDMARK_T1)
+tauc_T2_te  <- td_auc_at(test_mod_srv$time,test_mod_srv$event,lp_te,LANDMARK_T2)
+bs_T1_te    <- ipcw_brier_score(train_mod_srv$time,train_mod_srv$event,
+                                test_mod_srv$time,test_mod_srv$event, S_T1_te, LANDMARK_T1)
+bs_T2_te    <- ipcw_brier_score(train_mod_srv$time,train_mod_srv$event,
+                                test_mod_srv$time,test_mod_srv$event, S_T2_te, LANDMARK_T2)
+ibs_te      <- integrated_brier_score(train_mod_srv$time,train_mod_srv$event,
+                                      test_mod_srv$time,test_mod_srv$event, surv_model, lp_te)
+
+obs_T1_te   <- obs_lapse_by_t(test_mod_srv$time, test_mod_srv$event, LANDMARK_T1)
+bm_W_test   <- binary_lapse_metrics(test_data$lapse_flag, 1-S_T2_te)
+cm_W_test   <- confusion_metrics(test_data$lapse_flag, 1-S_T2_te)
+hl_W_test   <- hl_test_bin(test_data$lapse_flag, 1-S_T2_te)
+
+lapsed_te_idx  <- which(test_mod_srv$event==1L)
+cox_when_te_p  <- pmin((1-S_T1_te[lapsed_te_idx]) /
+                         pmax(1-S_T2_te[lapsed_te_idx],1e-10), 1)
+early_obs_te   <- as.integer(test_mod_srv$time[lapsed_te_idx]<=LANDMARK_T1)
+bm_WN_test     <- binary_lapse_metrics(early_obs_te, cox_when_te_p)
+cm_WN_test     <- confusion_metrics(early_obs_te, cox_when_te_p)
+hl_WN_test     <- hl_test_bin(early_obs_te, cox_when_te_p)
+
+cat(sprintf("  C-Index=%.4f | td-AUC(T1)=%.4f | td-AUC(T2)=%.4f\n", ci_te,tauc_T1_te,tauc_T2_te))
+cat(sprintf("  Brier(T1)=%.4f | Brier(T2)=%.4f | IBS=%.4f\n", bs_T1_te,bs_T2_te,ibs_te))
+cat("\n  WHETHER (test):\n")
+print(round(bm_W_test[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat(sprintf("    TP=%d TN=%d FP=%d FN=%d | HL: stat=%.3f p=%.4f\n",
+            cm_W_test$TP,cm_W_test$TN,cm_W_test$FP,cm_W_test$FN,
+            hl_W_test$HL_stat,hl_W_test$p_value))
+cat(sprintf("\n  WHEN (test, %d lapsed obs):\n", length(lapsed_te_idx)))
+print(round(bm_WN_test[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat(sprintf("    TP=%d TN=%d FP=%d FN=%d | HL: stat=%.3f p=%.4f\n",
+            cm_WN_test$TP,cm_WN_test$TN,cm_WN_test$FP,cm_WN_test$FN,
+            hl_WN_test$HL_stat,hl_WN_test$p_value))
+
+cat("\n--- 7f. Calibration Tables at T1 and T2 (test set) ---\n")
+cat(sprintf("  T1=%d (renewal letter dispatch):\n", LANDMARK_T1))
+print(calibration_table_surv(obs_T1_te, 1-S_T1_te))
+cat(sprintf("  T2=%d (policy expiry):\n", LANDMARK_T2))
+print(calibration_table_surv(test_data$lapse_flag, 1-S_T2_te))
+
+cat("\n--- 7g. Interval-Specific Lapse Risk (test set) ---\n")
+cat("  Three mutually exclusive intervals derived from the Cox survival curve.\n")
+irisk <- data.frame(P_early=1-S_T1_te, P_window=S_T1_te-S_T2_te, P_complete=S_T2_te)
+print(round(t(apply(irisk,2,function(x) c(Mean=mean(x),SD=sd(x),Min=min(x),Max=max(x)))),4))
+
+export_glm_summary(surv_model, "baseline_days_to_event")
+
+plot_calibration(calibration_table_surv(obs_T1_te, 1-S_T1_te))
+```
+
+\underline{Discussion:}
+
+**Global Fit and Key Coefficients**
+
+Fitted on 66,184 training observations with 11,132 lapse events (16.8% rate). All three global tests reject no-effect (LR chi2=13,098.94, Wald chi2=14,448.16, Score chi2=17,759.63; all df=57, p<2x10^-16). had_previous_lapse dominates with HR=16.61 (z=81.75). Spring/Summer starts carry HRs of 2.22/2.12, Winter 0.45. Semi-annual payment (HR=1.357) and multi-policy holder status (HR=0.264) are also notable.
+
+**Proportional Hazards Assumption Violation**
+
+The Grambsch-Therneau global test (chi2=3,284.81, df=57, p<2x10^-16) confirms the PH assumption is violated at the portfolio level. The worst offenders are had_previous_lapse (chi2=642), cross_sell_ratio_band (chi2=110), the three seasonal indicators (all chi2>216), multi_policy_holder (chi2=128), and payment_label_Semi_annual (chi2=54.6) -- meaning these predictors' effects change over the policy year rather than staying constant, so the Cox coefficients are best read as time-averaged effects.
+
+**Survival-Specific Discrimination and Predictive Accuracy**
+
+Despite the PH violation, the Cox model discriminates event timing exceptionally well: C-Index = 0.9376 (train), 0.9370 ± 0.0021 (CV), 0.9408 (test) -- ranking ~94% of policy pairs correctly. Time-dependent AUC is 0.9692 at T1 (CV mean, SE 0.0022) and rises to 0.9923 at T2. IPCW Brier at T1 is 0.0244 (train/CV) and 0.0252 (test) -- well calibrated at the renewal threshold -- and IBS is stable at 0.0663-0.0666 throughout. The IPCW Brier at T2 exceeds 1 in every context (train 1.0268, CV 1.0333, test 1.0297), which is anomalous given the metric is bounded [0,1]. This happens because every non-lapsed policy has days_to_event recorded as exactly 365, so none satisfy val_time > T2 in the IPCW formula -- the score is computed only over lapsed observations with unstable weights near the horizon, and should be read alongside the calibration tables rather than on its own.
+
+**WHETHER Performance**
+
+As a binary classifier for whether-lapse (1-S(T2=365)), Cox is substantially inferior to Stage 1: test AUC 0.6485 vs 0.7369, Brier 0.3653 vs 0.115, R² 0.031 vs 0.182 -- all gaps far exceeding CV standard errors. The calibration table shows why: Cox overestimates lapse probability across deciles (lowest decile predicts 0.150 vs observed 0.113; decile 5 predicts 0.558 vs observed 0.127), averaging ~0.60 against an actual rate of 16.9% -- roughly 3.5x overestimation, with HL=52,210.760 confirming the severity. At the 0.5 threshold this yields recall 0.713 but precision only 0.202 (F1=0.314, FP=7,897). Cox is excellent for relative ranking but not calibrated for absolute binary classification -- it's optimised for hazard ratios, not marginal probabilities.
+
+**WHEN Performance**
+
+On the WHEN question, Cox's conditional probability (1-S(T1))/(1-S(T2)) performs better -- AUC 0.960 (CV 0.9543 ± 0.0027), Brier 0.1201, R² 0.4963 -- though still below Stage 2 on every metric. At 0.5, it's a highly conservative classifier: specificity 0.997, precision 0.970, but recall only 0.281 (F1=0.435), since it's algebraically derived from a hazard-ratio model rather than fitted to the binary timing outcome, so it stays near-zero except for the most extreme risk profiles.
+
+**Interval-Specific Lapse Risk Distribution**
+Across the 16,559 test policies: mean P(lapse before letter) = 0.041 (SD=0.079, range 0.001-0.840), mean P(lapse in pre-renewal window) = 0.560 (SD=0.245), mean P(complete the year) = 0.400 (SD=0.274). Most lapse risk sits in the pre-renewal window, suggesting renewal-letter-stage interventions matter most -- though these figures inherit the 1-S(T2) calibration issues noted above and should be read alongside Stage 2's output.
+
+## Binary Lapse Model Stage 2: given lapse, early lapse or late lapse?
+
+Stage 2 is a logistic GLM fitted only on the lapsed sub-population, estimating P(early lapse | lapse=1). The target early_lapse is fully observed (1 if lapse ≤ day 300, 0 if between days 300-365), so no censoring is involved. It inherits the Stage 1 train/test split and encoding schema, with each CV fold restricted to lapsed policies only. Since the drivers of whether vs when a policy lapses may differ, Stage 2's predictors need not match Stage 1's. Evaluation uses the same full metric suite, enabling direct comparison against the Cox conditional probability on the same lapsed subset.
+
+
+```{r, echo=FALSE}
+cat("\n====================================================\n")
+cat("SECTION 8: STAGE 2 — P(Early Lapse | Lapse = 1)\n")
+cat(sprintf("           Target: I(days_to_event <= %d)\n", LANDMARK_T1))
+cat("====================================================\n")
+
+train_data_lapsed <- train_data %>%
+  filter(lapse_flag==1) %>%
+  mutate(early_lapse=as.integer(days_to_event<=LANDMARK_T1))
+test_data_lapsed  <- test_data %>%
+  filter(lapse_flag==1) %>%
+  mutate(early_lapse=as.integer(days_to_event<=LANDMARK_T1))
+
+cat(sprintf("\n  Training lapsed subset : %d obs | early=%d (%.1f%%) | late=%d (%.1f%%)\n",
+            nrow(train_data_lapsed),
+            sum(train_data_lapsed$early_lapse==1),
+            100*mean(train_data_lapsed$early_lapse==1),
+            sum(train_data_lapsed$early_lapse==0),
+            100*mean(train_data_lapsed$early_lapse==0)))
+cat(sprintf("  Test lapsed subset     : %d obs | early=%d (%.1f%%) | late=%d (%.1f%%)\n",
+            nrow(test_data_lapsed),
+            sum(test_data_lapsed$early_lapse==1),
+            100*mean(test_data_lapsed$early_lapse==1),
+            sum(test_data_lapsed$early_lapse==0),
+            100*mean(test_data_lapsed$early_lapse==0)))
+
+enc_s2     <- encode_predictors(train_data_lapsed, test_data_lapsed, "early_lapse")
+train_s2   <- cbind(y=train_data_lapsed$early_lapse, enc_s2$train)
+test_s2    <- cbind(y=test_data_lapsed$early_lapse,  enc_s2$test)
+stage2_model <- glm(y ~ ., data=train_s2, family=binomial())
+
+cat("\n--- 8a. MODEL SUMMARY ---\n")
+print(summary(stage2_model))
+
+# --- 8b. Train GLM Diagnostics ---
+# Same diagnostics as Stage 1 (Section 6b), applied to the lapsed sub-population.
+cat("\n--- 8b. TRAIN GLM DIAGNOSTICS ---\n")
+cat("Null Deviance     :", round(stage2_model$null.deviance,2),
+    " on", stage2_model$df.null, "df\n")
+cat("Residual Deviance :", round(stage2_model$deviance,2),
+    " on", stage2_model$df.residual, "df\n")
+cat("AIC               :", round(AIC(stage2_model),2), "\n")
+s2_pX2 <- sum(residuals(stage2_model, type="pearson")^2)
+s2_pdf <- stage2_model$df.residual
+s2_pp  <- pchisq(s2_pX2, s2_pdf, lower.tail=FALSE)
+cat(sprintf("Pearson GOF       : X\u00b2=%.2f  df=%d  p=%.4f\n", s2_pX2, s2_pdf, s2_pp))
+
+# --- 8c. Train In-sample Metrics ---
+p_train_s2       <- predict(stage2_model, train_s2, type="response")
+train_metrics_s2 <- binary_lapse_metrics(train_s2$y, p_train_s2)
+cm_train_s2      <- confusion_metrics(train_s2$y, p_train_s2)
+cat("\n--- 8c. TRAIN IN-SAMPLE METRICS (threshold =", LAPSE_THRESHOLD, ") ---\n")
+print(round(train_metrics_s2[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat(sprintf("    TP=%d  TN=%d  FP=%d  FN=%d\n",
+            cm_train_s2$TP,cm_train_s2$TN,cm_train_s2$FP,cm_train_s2$FN))
+print(round(train_metrics_s2[,c("Accuracy","Precision","Recall","Specificity","F1")],4))
+
+# --- 8d. Cross-Validation ---
+# Each fold subsets to lapsed policies only; tryCatch skips folds too small or with no
+# variation in early_lapse (those folds are excluded from the Mean ± SE computation).
+cat("\n--- 8d. CV SCORES (TRAIN) — Mean \u00b1 SE across eligible folds ---\n")
+cv_results_s2 <- lapply(cv_folds$splits, function(sp) {
+  tr_l <- analysis(sp)   %>% filter(lapse_flag==1) %>%
+    mutate(early_lapse=as.integer(days_to_event<=LANDMARK_T1))
+  va_l <- assessment(sp) %>% filter(lapse_flag==1) %>%
+    mutate(early_lapse=as.integer(days_to_event<=LANDMARK_T1))
+  tryCatch({
+    if (nrow(tr_l)<10 || nrow(va_l)<2)       stop("too few lapsed obs")
+    if (length(unique(tr_l$early_lapse))<2)   stop("no variation in target")
+    enc <- encode_predictors(tr_l, va_l, "early_lapse")
+    m   <- glm(tr_l$early_lapse ~ ., data=cbind(enc$train), family=binomial())
+    p   <- predict(m, enc$test, type="response")
+    fm  <- binary_lapse_metrics(va_l$early_lapse, p); fm$AIC <- AIC(m); fm
+  }, error=function(e) NULL)
+})
+cv_results_s2 <- Filter(Negate(is.null), cv_results_s2)
+cat(sprintf("  Folds contributing to CV: %d of %d\n",
+            length(cv_results_s2), nrow(cv_folds)))
+cv_tbl_s2 <- do.call(rbind, cv_results_s2)
+cv_sum_s2 <- cv_summary(cv_tbl_s2)
+print(round(cv_sum_s2[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini","AIC")],4))
+print(round(cv_sum_s2[,c("Accuracy","Precision","Recall","Specificity","F1")],4))
+
+# --- 8e. Test Set ---
+p_test_s2       <- predict(stage2_model, test_s2, type="response")
+test_metrics_s2 <- binary_lapse_metrics(test_s2$y, p_test_s2)
+cm_test_s2      <- confusion_metrics(test_s2$y, p_test_s2)
+hl_s2_test      <- hl_test_bin(test_s2$y, p_test_s2)
+cat("\n--- 8e. TEST SCORES (threshold =", LAPSE_THRESHOLD, ") ---\n")
+print(round(test_metrics_s2[,c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")],4))
+cat(sprintf("    TP=%d  TN=%d  FP=%d  FN=%d\n",
+            cm_test_s2$TP,cm_test_s2$TN,cm_test_s2$FP,cm_test_s2$FN))
+print(round(test_metrics_s2[,c("Accuracy","Precision","Recall","Specificity","F1")],4))
+cat(sprintf("  HL Calibration Test: HL=%.3f  df=%d  p=%.4f\n",
+            hl_s2_test$HL_stat, hl_s2_test$df, hl_s2_test$p_value))
+cat("\n--- 8f. Stage 2 Calibration Table (test set) ---\n")
+print(calibration_table_bin(test_s2$y, p_test_s2))
+
+export_glm_summary(stage2_model, "baseline_stage2_early_lapse")
+plot_calibration(calibration_table_bin(test_s2$y, p_test_s2))
+```
+\underline{Discussion:}
+
+**Data Composition and Model Fit**
+
+Of 11,132 training lapsed policies, 2,506 (22.5%) are early lapsers, 8,626 (77.5%) late -- closely mirrored in test (639/2,802, 22.8%). The model achieves a 77.2% deviance reduction (null 11,873.57 -> residual 2,709.17), roughly 4-5x Stage 1's 16.2%, with AIC=2,825.17. The Pearson statistic (150,419.26) gives a high dispersion ratio (~13.6), but this reflects a bimodal prediction distribution (deciles 1-7 near zero, 9-10 near unity, sharp jump at decile 8) driven by had_previous_lapse's dominance, not widespread misfit.
+
+**Covariate Significance**
+
+had_previous_lapse (9.090, z=26.77) is over 3x its Stage 1 magnitude -- prior lapsers are concentrated in the early-departure segment. payment_label_Semi_annual (2.092, z=14.35) is strikingly different from its near-zero Stage 1 role (0.067), likely reflecting the mid-term decision point a semi-annual schedule creates. Multi-policy holders (-1.743) and growing-portfolio customers (-2.119) remain protective; higher vehicle value (-1.404) and claims history (-1.245) are also protective. Urban and broker-placed policies show reduced early-lapse risk -- the reverse of their Stage 1 direction -- confirming the whether and when drivers differ. Winter/Spring starts carry modest elevated risk (0.496, 0.299), echoing Stage 1's seasonal pattern.
+
+**Probabilistic Accuracy and Discrimination**
+
+Stage 2 discriminates far better than Stage 1: AUC 0.9847 (train) -> 0.9831 ± 0.0018 (CV) -> 0.9794 (test). Gini=0.9587 and R²=0.7548 (CV mean 0.7780 ± 0.0076) -- roughly 4x Stage 1's explanatory power. Brier=0.0432 (CV 0.0388 ± 0.0015) and RMSE=0.2078 confirm close probability estimates, with all metrics consistent across train/CV/test despite the smaller training population.
+
+**Classification Performance**
+
+At 0.5, Stage 2 is well-balanced: recall 0.9014 (576/639 early lapsers), specificity 0.9528, precision 0.8496 (102 FP), F1 0.8747 (CV mean 0.8856 ± 0.0025) -- a sharp contrast to Stage 1's F1 of 0.389. CV mean accuracy (0.9466 ± 0.0016), precision (0.8543 ± 0.0081), and recall (0.9199 ± 0.0070) all closely match the test values.
+
+**Calibration**
+HL=86.459 (df=8, p=0.0000) rejects calibration, but deciles 1-7 are well calibrated (predicted 0.0001-0.007, observed 0.000-0.011). Decile 8 shows the largest gap (predicted 0.434 vs observed 0.507, error -0.073); deciles 9-10 are well calibrated again (errors 0.018, 0.028). The rejection is driven mainly by this decile-8 transition and sample size, not widespread miscalibration.
+
+# Final Comparison
+
+Two formal comparisons evaluate the two-stage framework against the Cox model. **Comparison 1 (WHETHER)** contrasts Stage 1's P(lapse=1) with Cox's 1-S(T2=365) on the full portfolio against the same lapse_flag outcome. **Comparison 2 (WHEN)** contrasts Stage 2's P(early lapse | lapse=1) with the Cox-derived conditional probability (1-S(T1))/(1-S(T2)) on the lapsed subset only. Since the Cox conditional probability is algebraically derived rather than directly fitted, Comparison 2 tests whether a dedicated Stage 2 model adds value over what the Cox survival curve already provides. The smaller lapsed sample naturally yields wider CV standard errors in this second comparison.
+
+
+```{r, echo=FALSE}
+cat("\n====================================================\n")
+cat("SECTION 9: COMPARISONS\n")
+cat("====================================================\n")
+
+PM  <- c("R2","RMSE","MAE","Brier","Binom_Dev","AUC","Gini")
+CM  <- c("Accuracy","Precision","Recall","Specificity","F1")
+LBL <- c("Corr-R\u00b2","RMSE","MAE","Brier Score","Binom. Deviance",
+         "AUC","Gini","Accuracy","Precision","Recall","Specificity","F1")
+
+# --- 9a. Train GOF Summary (all three models side by side) ---
+cat("\n--- Table 9a. Train GOF Diagnostics (all three models) ---\n")
+print(kable(
+  data.frame(
+    Diagnostic=c("Null Deviance","Residual Deviance","AIC",
+                 "Pearson X\u00b2","Pearson df","Pearson p"),
+    Stage1_Binary=c(round(lapse_model$null.deviance,2),
+                    round(lapse_model$deviance,2),
+                    round(AIC(lapse_model),2),
+                    round(s1_pX2,2), s1_pdf, round(s1_pp,4)),
+    Stage2_Binary=c(round(stage2_model$null.deviance,2),
+                    round(stage2_model$deviance,2),
+                    round(AIC(stage2_model),2),
+                    round(s2_pX2,2), s2_pdf, round(s2_pp,4)),
+    stringsAsFactors=FALSE
+  ),
+  caption="Table 9a: Train GLM Diagnostics — Stage 1 vs Stage 2",
+  col.names=c("Diagnostic","Stage 1 (all policies)","Stage 2 (lapsed only)"),
+  align=c("l","c","c")
+))
+
+cat("\n--- Table 9b. Cox PH Train GOF Tests ---\n")
+print(kable(
+  data.frame(
+    Test=c("Likelihood Ratio","Wald","Score (Log-rank)",
+           "PH Assumption — Grambsch-Therneau (global)"),
+    Statistic=c(round(surv_smry$logtest["test"],2),
+                round(surv_smry$waldtest["test"],2),
+                round(surv_smry$sctest["test"],2),
+                round(ph_test$table["GLOBAL","chisq"],2)),
+    df=c(surv_smry$logtest["df"],surv_smry$waldtest["df"],
+         surv_smry$sctest["df"],ph_test$table["GLOBAL","df"]),
+    p_value=c(round(surv_smry$logtest["pvalue"],4),
+              round(surv_smry$waldtest["pvalue"],4),
+              round(surv_smry$sctest["pvalue"],4),
+              round(ph_test$table["GLOBAL","p"],4)),
+    stringsAsFactors=FALSE
+  ),
+  caption="Table 9b: Cox PH Train GOF Tests",
+  col.names=c("Test","Statistic","df","p-value"), align=c("l","c","c","c")
+))
+
+# --- 9c. Comparison 1: WHETHER ---
+cat(sprintf("\n--- Table 9c. COMPARISON 1 — WHETHER: Stage 1 Binary vs Cox (1-S(T2=%d)) ---\n",
+            LANDMARK_T2))
+cat("  Outcome: lapse_flag | Population: all policies | Both models on identical splits.\n\n")
+
+w_cv_cols <- paste0("W_", c("R2","RMSE","MAE","Brier","BD","AUC","Gini",
+                            "Acc","Prec","Rec","Spec","F1"))
+s1_tr <- c(round(unlist(train_metrics_lap[,PM]),4),
+           round(unlist(train_metrics_lap[,CM]),4))
+s1_cv <- c(round(cv_sum_lapse["Mean",PM],4), round(cv_sum_lapse["Mean",CM],4))
+s1_se <- c(round(cv_sum_lapse["SE",  PM],4), round(cv_sum_lapse["SE",  CM],4))
+s1_te <- c(round(unlist(test_metrics_lap[,PM]),4),
+           round(unlist(test_metrics_lap[,CM]),4))
+cx_tr <- c(round(unlist(bm_W_train[,PM]),4), round(unlist(bm_W_train[,CM]),4))
+cx_cv <- round(cv_sum_surv["Mean", w_cv_cols], 4)
+cx_se <- round(cv_sum_surv["SE",   w_cv_cols], 4)
+cx_te <- c(round(unlist(bm_W_test[,PM]),4), round(unlist(bm_W_test[,CM]),4))
+
+print(kable(
+  data.frame(Metric=LBL,
+             S1_Train=s1_tr, S1_CV_Mean=s1_cv, S1_CV_SE=s1_se, S1_Test=s1_te,
+             Cox_Train=cx_tr, Cox_CV_Mean=cx_cv, Cox_CV_SE=cx_se, Cox_Test=cx_te,
+             row.names=NULL, stringsAsFactors=FALSE),
+  caption=sprintf("Table 9c: WHETHER Comparison — Stage 1 Binary vs Cox 1-S(T2=%d)",LANDMARK_T2),
+  col.names=c("Metric","S1 Train","S1 CV Mean","S1 CV SE","S1 Test",
+              "Cox Train","Cox CV Mean","Cox CV SE","Cox Test"),
+  align=c("l",rep("c",8))
+))
+
+# --- 9d. Comparison 2: WHEN ---
+cat(sprintf("\n--- Table 9d. COMPARISON 2 — WHEN: Stage 2 Binary vs Cox (1-S(T1))/(1-S(T2)) ---\n"))
+cat(sprintf("  Outcome: I(days_to_event <= %d) | Population: lapsed policies only.\n", LANDMARK_T1))
+cat("  Cox conditional probability is NOT directly optimised by the Cox model;\n")
+cat("  it is derived algebraically as P(lapse before T1 | lapse occurs) = (1-S(T1))/(1-S(T2)).\n\n")
+
+wn_cv_cols <- paste0("WN_", c("R2","RMSE","MAE","Brier","BD","AUC","Gini",
+                              "Acc","Prec","Rec","Spec","F1"))
+s2_tr <- c(round(unlist(train_metrics_s2[,PM]),4), round(unlist(train_metrics_s2[,CM]),4))
+s2_cv <- c(round(cv_sum_s2["Mean",PM],4), round(cv_sum_s2["Mean",CM],4))
+s2_se <- c(round(cv_sum_s2["SE",  PM],4), round(cv_sum_s2["SE",  CM],4))
+s2_te <- c(round(unlist(test_metrics_s2[,PM]),4), round(unlist(test_metrics_s2[,CM]),4))
+cn_tr <- c(round(unlist(bm_WN_train[,PM]),4), round(unlist(bm_WN_train[,CM]),4))
+cn_cv <- round(cv_sum_surv["Mean", wn_cv_cols], 4)
+cn_se <- round(cv_sum_surv["SE",   wn_cv_cols], 4)
+cn_te <- c(round(unlist(bm_WN_test[,PM]),4), round(unlist(bm_WN_test[,CM]),4))
+
+print(kable(
+  data.frame(Metric=LBL,
+             S2_Train=s2_tr, S2_CV_Mean=s2_cv, S2_CV_SE=s2_se, S2_Test=s2_te,
+             Cox_Train=cn_tr, Cox_CV_Mean=cn_cv, Cox_CV_SE=cn_se, Cox_Test=cn_te,
+             row.names=NULL, stringsAsFactors=FALSE),
+  caption=sprintf("Table 9d: WHEN Comparison — Stage 2 Binary vs Cox (1-S(T1))/(1-S(T2))"),
+  col.names=c("Metric","S2 Train","S2 CV Mean","S2 CV SE","S2 Test",
+              "Cox Train","Cox CV Mean","Cox CV SE","Cox Test"),
+  align=c("l",rep("c",8))
+))
+
+# --- 9e. Cox Survival-Specific Metrics (WHEN dimension, time-resolved) ---
+cat("\n--- Table 9e. Cox Survival-Specific Metrics (time-resolved WHEN dimension) ---\n")
+cat("  These metrics have no counterpart in either binary GLM and represent\n")
+cat("  the exclusive contribution of the Cox model to the framework.\n\n")
+print(kable(
+  data.frame(
+    Metric=c("C-Index (ranking discrimination)",
+             paste0("td-AUC @ T1=",LANDMARK_T1," (letter)"),
+             paste0("td-AUC @ T2=",LANDMARK_T2," (expiry)"),
+             paste0("IPCW Brier @ T1=",LANDMARK_T1),
+             paste0("IPCW Brier @ T2=",LANDMARK_T2),
+             "Integrated Brier Score (IBS)"),
+    Train=c(round(ci_train,4),round(tauc_T1_tr,4),round(tauc_T2_tr,4),
+            round(bs_T1_tr,4),round(bs_T2_tr,4),round(ibs_tr,4)),
+    CV_Mean=c(round(cv_sum_surv["Mean","C_Index"],4),
+              round(cv_sum_surv["Mean","tdAUC_T1"],4),
+              round(cv_sum_surv["Mean","tdAUC_T2"],4),
+              round(cv_sum_surv["Mean","Brier_T1"],4),
+              round(cv_sum_surv["Mean","Brier_T2"],4),
+              round(cv_sum_surv["Mean","IBS"],4)),
+    CV_SE=c(round(cv_sum_surv["SE","C_Index"],4),
+            round(cv_sum_surv["SE","tdAUC_T1"],4),
+            round(cv_sum_surv["SE","tdAUC_T2"],4),
+            round(cv_sum_surv["SE","Brier_T1"],4),
+            round(cv_sum_surv["SE","Brier_T2"],4),
+            round(cv_sum_surv["SE","IBS"],4)),
+    Test=c(round(ci_te,4),round(tauc_T1_te,4),round(tauc_T2_te,4),
+           round(bs_T1_te,4),round(bs_T2_te,4),round(ibs_te,4)),
+    row.names=NULL, stringsAsFactors=FALSE
+  ),
+  caption="Table 9e: Cox PH — Survival-Specific Metrics (exclusive to the Cox framework)",
+  col.names=c("Metric","Train","CV Mean","CV SE","Test"), align=c("l","c","c","c","c")
+))
+
+# --- 9f. Joint Three-Probability Decomposition (test set) ---
+cat("\n--- Table 9f. Joint Three-Probability Decomposition (test set) ---\n")
+cat("  For each test policy, three mutually exclusive lapse probabilities are\n")
+cat("  formed from the two-stage framework output:\n")
+cat("    P(no lapse)        = 1 - p1\n")
+cat("    P(early lapse)     = p1 * p2\n")
+cat("    P(pre-ren. lapse)  = p1 * (1 - p2)\n")
+cat("  where p1 = Stage 1 prediction (all test obs)\n")
+cat("        p2 = Stage 2 prediction applied to all test obs via Stage 2 recipe.\n\n")
+
+# Apply Stage 2 recipe to ALL test observations (not just lapsed subset).
+pred_cols_s2  <- get_predictor_cols(train_data_lapsed, "early_lapse")
+x_test_all_s2 <- recode_ordinals(test_data[, pred_cols_s2, drop=FALSE])
+p2_all_test   <- predict(stage2_model,
+                         bake(enc_s2$recipe, new_data=x_test_all_s2),
+                         type="response")
+
+joint_probs <- data.frame(
+  P_no_lapse    = 1 - p_test_lap,
+  P_early_lapse = p_test_lap * p2_all_test,
+  P_pren_lapse  = p_test_lap * (1 - p2_all_test)
+)
+
+cat("  Summary statistics across all test policies:\n")
+print(round(t(apply(joint_probs, 2, function(x)
+  c(Mean=mean(x),SD=sd(x),Min=min(x),Median=median(x),Max=max(x)))), 4))
+cat("\n  Note: the three probabilities sum to 1 for every policy (within rounding).\n")
+cat("  Verified:", all(abs(rowSums(joint_probs) - 1) < 1e-6), "\n")
+
+cat("\n--- Table 9g. HL Calibration Tests — All Three Models (test set) ---\n")
+print(kable(
+  data.frame(
+    Model=c("Stage 1 Binary: P(lapse)",
+            paste0("Cox WHETHER: 1-S(T2=",LANDMARK_T2,")"),
+            "Stage 2 Binary: P(early lapse | lapse)",
+            paste0("Cox WHEN: (1-S(T1))/(1-S(T2)) on lapsed subset")),
+    Outcome=c("lapse_flag","lapse_flag","early_lapse","early_lapse"),
+    Population=c("All policies","All policies","Lapsed only","Lapsed only"),
+    HL_stat=c(hl_s1_test$HL_stat, hl_W_test$HL_stat,
+              hl_s2_test$HL_stat, hl_WN_test$HL_stat),
+    df=c(hl_s1_test$df,  hl_W_test$df,  hl_s2_test$df,  hl_WN_test$df),
+    p_value=c(hl_s1_test$p_value, hl_W_test$p_value,
+              hl_s2_test$p_value, hl_WN_test$p_value),
+    stringsAsFactors=FALSE
+  ),
+  caption="Table 9g: Hosmer-Lemeshow Calibration Tests (test set)",
+  col.names=c("Model","Outcome","Population","HL Stat","df","p-value"),
+  align=c("l","c","c","c","c","c")
+))
+```
+
+\underline{Discussion:}
+
+**Training GOF Comparison (Tables 9a and 9b)**
+
+Table 9a/9b summarise the GOF diagnostics already discussed: Stage 1's 16.2% vs Stage 2's 77.2% deviance reduction reflects the much stronger signal once conditioned on lapsed policies, and the Cox PH violation (chi2=3,284.81) again qualifies all Cox-derived outputs below.
+
+**Comparison 1 — WHETHER (Table 9c)**
+
+Table 9c confirms Stage 1 is materially superior to Cox WHETHER on every metric (AUC 0.7369 vs 0.6485, Brier 0.115 vs 0.365, R² 0.182 vs 0.031), as detailed in the Cox section above. The two also trade off differently at the 0.5 threshold: Cox favours recall (0.713) at the cost of precision (0.202, F1=0.314), while Stage 1 is more balanced (precision 0.695, recall 0.271, F1=0.389) -- a direct consequence of Cox's ~3.5x overestimation of the portfolio lapse rate.
+
+**Comparison 2 — WHEN (Table 9d)**
+
+Table 9d shows Stage 2 outperforms Cox WHEN on every probabilistic metric (AUC 0.9794 vs 0.960, Brier 0.043 vs 0.120, R² 0.755 vs 0.496). At the 0.5 threshold, Cox WHEN is highly conservative (precision 0.970, specificity 0.997, recall only 0.281, F1=0.435), while Stage 2 is more operationally useful (recall 0.901, precision 0.850, F1=0.875). For retention action on early departures, Stage 2 is the better instrument; Cox WHEN's near-perfect specificity could serve as a secondary filter where false positives are costly.
+
+**Cox Survival-Specific Metrics (Table 9e)**
+
+Table 9e covers metrics with no counterpart in the binary GLMs: C-Index 0.9370 (CV SE 0.0021), td-AUC 0.9692 at T1 / 0.9923 at T2, IPCW Brier 0.0244 at T1, IBS 0.0663-0.0666 (SE 0.0012). These confirm the Cox model's unique contribution -- a continuous survival curve enabling interval-specific risk decomposition and time-resolved portfolio profiling -- complementary to, rather than competing with, the binary GLMs.
+**Joint Three-Probability Decomposition (Table 9f)**
+
+Combining Stage 1 and Stage 2 across the 16,559 test policies: mean P(no lapse)=0.831 (SD=0.159), matching the actual non-lapse rate of 83.1%. Mean P(early lapse)=0.035 (SD=0.135) and P(pre-renewal lapse)=0.134 (SD=0.085) -- the early-lapse probability is far more dispersed relative to its mean (SD/mean ~386% vs ~63%), consistent with early lapse being driven by a few powerful predictors (had_previous_lapse, payment_label_Semi_annual) rather than spread across Stage 1's broader predictor space. The three probabilities sum to exactly 1 for every policy.
+
+**Hosmer–Lemeshow Calibration Across All Models (Table 9g)**
+All four models formally fail the HL test, but the relative magnitudes matter more than the p-values: Stage 1 (35.132) and Stage 2 (86.459) are both modest, reflecting localised rather than systematic miscalibration; Cox WHETHER (52,210.760) and Cox WHEN (1,040.526) are far worse, consistent with the systematic overestimation already documented in Comparisons 1 and 2. The large sample size amplifies even small deviations, so these statistics should be read alongside the decile calibration tables.
+
+
+# Conclusion
+
+This baseline framework decomposes lapse into whether and when, and the two formal comparisons show the two-stage binary framework and the Cox model are complementary rather than competing.
+
+For WHETHER, Stage 1 is unambiguously superior (AUC 0.737, Brier 0.115, F1 0.389), since Cox's 1-S(T2) overestimates portfolio lapse rates by ~3.5x -- a consequence of being optimised for hazard ranking, not probability calibration. For WHEN, Stage 2 is the stronger classifier on every metric (AUC 0.979, Brier 0.043, F1 0.875 vs Cox's 0.960/0.120/0.435), with near-complete recall (0.901) suited to retention intervention; Cox WHEN's near-perfect specificity (0.997) could still serve as a conservative secondary filter. The Cox model's unique value lies elsewhere: its full survival curve gives interval-specific risk across all three operational windows and ranks lapse timing (C-Index 0.941) more precisely than any static binary model.
+
+The Grambsch-Therneau violation (chi2=3,284.81) means Cox's hazard ratios should be read as time-averaged effects rather than absolute calibrated estimates, most pronounced for prior lapse history, cross-sell ratio, and seasonal variables. The two-stage framework, by contrast, is well-calibrated and directly interpretable, with its three-probability decomposition summing to unity and matching the portfolio's observed 16.9% lapse rate. Together, Stage 1, Stage 2, and Cox each play a distinct, non-redundant role in the broader framework.
+
